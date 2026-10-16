@@ -1,0 +1,19 @@
+# 运行时状态库与 worktree
+.swarm/
+.swarm-demo/
+
+# 依赖
+node_modules/
+
+# 凭据：绝不入库
+api.json
+**/api.json
+.env
+.env.*
+*.key
+*.pem
+
+# 日志与临时产物
+*.log
+*.tmp
+.DS_Store
