@@ -592,6 +592,517 @@ async function scenarioReaperGuard() {
   fs.rmSync(repoDir, { recursive: true, force: true });
 }
 
+// ---------- 场景 12：m3 结构三连检门禁前置（语法烂提交在 testCmd 之前被拦截） ----------
+// testCmd 是会通过的（exit 0）——若结构检查不存在/失效，烂 JS 会直接落地。
+// 断言它必须被 stage='structure' 拦下：item 退回 pending、FAIL 上下文带 baseline、集成记录 test_passed=0。
+async function scenarioStructureGate() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'broken js', createdBy: 'test' });
+  const PORT = 17879;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'structure gate test',
+    testCmd: 'node -e process.exit(0)', // 门禁本身会过 → 只有结构检查能拦下这个提交
+    maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
+  });
+  runner.echoScripts = {
+    w1: [
+      'claim t1',
+      'file src/broken.js function broken( {', // 单行非法 JS：node --check 必挂
+      'commit broken',
+      'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+      'say submitted',
+    ].join('\n'),
+  };
+  runner.startIntegrator();
+  await runner.spawnWorker('w1');
+  await waitFor(() => store.integrations().length >= 1 && store.item('t1').status === 'pending',
+    { label: 'structure gate rejected', timeoutMs: 30000 });
+
+  const failCtx = store.searchContext('stage=structure', 10);
+  check('结构门禁：item 退回 pending（testCmd 未被烧）', store.item('t1').status === 'pending');
+  check('结构门禁：发布 stage=structure 的 FAIL 上下文', failCtx.length > 0,
+    JSON.stringify(failCtx.map((c) => c.text.slice(0, 120))));
+  check('结构门禁：FAIL 文本含 syntax error 与文件名',
+    failCtx.length > 0 && /syntax error in src\/broken\.js/.test(failCtx[0].text),
+    failCtx[0]?.text.slice(0, 200));
+  check('结构门禁：FAIL 文本带 baseline 回滚点（m1\'）',
+    failCtx.length > 0 && /baseline=[0-9a-f]{6,}/.test(failCtx[0].text) && !/baseline=unknown/.test(failCtx[0].text),
+    failCtx[0]?.text.match(/baseline=\S+/)?.[0]);
+  const ints = store.integrations();
+  check('结构门禁：集成记录 merged=0 且 test_passed=0', ints.some((i) => i.merged === 0 && i.test_passed === 0),
+    JSON.stringify(ints.map((i) => ({ merged: i.merged, passed: i.test_passed }))));
+  // 集成分支确实没被污染
+  const onInt = git(['ls-tree', '-r', '--name-only', 'swarm/integration'], repoDir);
+  check('结构门禁：烂文件未落地集成分支', !onInt.includes('src/broken.js'));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+
+  // ---- 单元级补充：conflict marker 成对检测（echo file 只写单行，E2E 写不出成对标记）----
+  const repoDir2 = tmpRepo();
+  const repo2 = new Repo(repoDir2); repo2.init();
+  const itDir = repo2.ensureIntegrationWorktree();
+  // _structureCheck 以 this.integrationHead 为 diff base：先记录基线再提交
+  repo2.integrationHead = git(['rev-parse', 'HEAD'], repoDir2);
+  fs.writeFileSync(path.join(itDir, 'doc.md'), '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n');
+  git(['add', 'doc.md'], itDir);
+  git(['-c', 'user.name=swarm', '-c', 'user.email=swarm@local', 'commit', '-m', 'markers'], itDir);
+  let sc = await repo2._structureCheck(itDir);
+  check('结构单元：成对 conflict marker 被拦截', sc.ok === false && /conflict marker/.test(sc.reason),
+    JSON.stringify(sc));
+  // 反例：仅 `=======`（markdown setext 标题下划线）不得误报
+  const repoDir3 = tmpRepo();
+  const repo3 = new Repo(repoDir3); repo3.init();
+  const itDir3 = repo3.ensureIntegrationWorktree();
+  repo3.integrationHead = git(['rev-parse', 'HEAD'], repoDir3);
+  fs.writeFileSync(path.join(itDir3, 'readme.md'), 'Title\n=======\n\nbody\n');
+  git(['add', 'readme.md'], itDir3);
+  git(['-c', 'user.name=swarm', '-c', 'user.email=swarm@local', 'commit', '-m', 'setext'], itDir3);
+  sc = await repo3._structureCheck(itDir3);
+  check('结构单元：setext 标题下划线不误报', sc.ok === true, JSON.stringify(sc));
+
+  fs.rmSync(repoDir2, { recursive: true, force: true });
+  fs.rmSync(repoDir3, { recursive: true, force: true });
+}
+
+// ---------- 场景 13：P5 冲突吸收 + redo 预算退场 ----------
+// 两个 worker 同时 spawn、同写 src/shared.txt 不同内容：集成器合完赢家后，
+// 输家的 sync（真实 merge）必然与集成分支冲突 → skew 累积。
+// P5 语义：skew≥3 不再挂起，而是 备份分叉线(swarm/backup-<name>) + reset 回集成分支 +
+// 广播 CONFLICT 上下文（HOT FILES）→ skew 归零重做；redo 预算耗尽 → retired_redo_exhausted。
+// 关键：必须同时 spawn——若输家后出生，其基线已含赢家文件且集成分支不再推进（纪元短路），永不冲突。
+async function scenarioSyncSkew() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'collide a', createdBy: 'test' });
+  store.addItem({ id: 't2', title: 'collide b', createdBy: 'test' });
+  const PORT = 17878;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'sync skew test', testCmd: null,
+    maxTurns: 40, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 2,
+  });
+  // 各 claim 各的 item（echo 的 claim 不支持 shell 条件语法），但同写一个文件：
+  // 两分支同 base 各改 src/shared.txt → 第二个被集成的必然 stage='merge' 失败，
+  // 其后续基线刷新（真实 merge）也必然冲突 → skew 累积。
+  // 吸收（reset 回集成分支）后输家基线已含赢家内容 → 重做写 from-<loser> 干净合并。
+  const collide = (item, own) => [
+    `claim ${item}`,
+    `file src/shared.txt ${own}`,
+    'commit collide',
+    'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+    'say submitted',
+  ].join('\n');
+  runner.echoScripts = { w1: collide('t1', 'from-w1'), w2: collide('t2', 'from-w2') };
+  runner.startIntegrator();
+  await runner.spawnWorker('w1');
+  await runner.spawnWorker('w2');
+
+  // 输家 = 第二个被集成的提交的 peer：其基线刷新（真实 merge）与集成分支冲突
+  await waitFor(() => store.eventsAfter(0, 500).some((e) => e.type === 'worker.sync_conflict'),
+    { label: 'first sync conflict', timeoutMs: 30000 });
+  const conflictEv = store.eventsAfter(0, 500).find((e) => e.type === 'worker.sync_conflict');
+  check('syncSkew：冲突事件带文件清单', (conflictEv.payload.files || []).includes('src/shared.txt'),
+    JSON.stringify(conflictEv.payload));
+
+  // P5 吸收：skew 达 3 → conflict_absorbed 事件（redo#、备份分支名）
+  const loserName = conflictEv.payload.name;
+  await waitFor(() => {
+    return store.eventsAfter(0, 500).some((e) => e.type === 'worker.conflict_absorbed' && e.payload.name === loserName);
+  }, { label: 'loser absorbed', timeoutMs: 60000 });
+  const absEv = store.eventsAfter(0, 500).find((e) => e.type === 'worker.conflict_absorbed' && e.payload.name === loserName);
+  check('P5 吸收：事件带 redo 序号与备份分支', absEv.payload.redo === 1 && absEv.payload.backup === `swarm/backup-${loserName}`,
+    JSON.stringify(absEv.payload));
+  check('P5 吸收：备份分支真实存在', git(['branch', '--list', `swarm/backup-${loserName}`], repoDir).trim() !== '',
+    git(['branch', '--list', `swarm/backup-${loserName}`], repoDir));
+  // CONFLICT 上下文已广播（HOT FILES 清单进共享 context，全队下回合简报可见）
+  const confCtx = store.db.prepare("SELECT * FROM context WHERE kind='CONFLICT' AND peer=?").all(loserName);
+  check('P5 吸收：CONFLICT 上下文含 HOT FILES', confCtx.length > 0 && (confCtx[0].text || '').includes('src/shared.txt'),
+    JSON.stringify((confCtx[0] || {}).text || '').slice(0, 160));
+  // 吸收 ≠ 退场：loser 重置基线继续干，t2 应最终完成（重做后干净合并）
+  await waitFor(() => store.item('t2').status === 'done', { label: 'loser item done after absorb', timeoutMs: 60000 });
+  check('P5 吸收：吸收后输家完成自己的 item', store.item('t2').status === 'done',
+    JSON.stringify({ t1: store.item('t1').status, t2: store.item('t2').status }));
+  check('P5 吸收：输家未退场', runner.workers.get(loserName)?.status !== 'retired',
+    String(runner.workers.get(loserName)?.status));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 13b：P5 redo 预算耗尽 → retired_redo_exhausted ----------
+// maxConflictRedo=0（实例属性，runner 构造器不收）：skew 达 3 即预算耗尽退场。
+async function scenarioRedoExhausted() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'collide a', createdBy: 'test' });
+  store.addItem({ id: 't2', title: 'collide b', createdBy: 'test' });
+  const PORT = 17876;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'redo budget test', testCmd: null,
+    maxTurns: 40, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 2,
+  });
+  runner.maxConflictRedo = 0; // 零预算：skew 一到 3 就退场，不走吸收
+  const collide = (item, own) => [
+    `claim ${item}`,
+    `file src/shared.txt ${own}`,
+    'commit collide',
+    'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+    'say submitted',
+  ].join('\n');
+  runner.echoScripts = { w1: collide('t1', 'from-w1'), w2: collide('t2', 'from-w2') };
+  runner.startIntegrator();
+  await runner.spawnWorker('w1');
+  await runner.spawnWorker('w2');
+
+  await waitFor(() => {
+    return store.eventsAfter(0, 500).some((e) => e.type === 'worker.retired_redo_exhausted');
+  }, { label: 'retired by redo exhaustion', timeoutMs: 60000 });
+  const retEv = store.eventsAfter(0, 500).find((e) => e.type === 'worker.retired_redo_exhausted');
+  const retName = retEv.payload.name;
+  check('P5 预算耗尽：redo=0 时 skew≥3 直接退场', retEv.payload.skew >= 3 && retEv.payload.redos === 0,
+    JSON.stringify(retEv.payload));
+  check('P5 预算耗尽：退场时 status=retired', runner.workers.get(retName)?.status === 'retired',
+    String(runner.workers.get(retName)?.status));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 15：P1 批量集成——多条不相交提交一次门禁成批 ----------
+// 构造法：先 spawn 两个 worker 让它们各自提交入队（改的文件不相交），再 startIntegrator——
+// 集成器首轮 poll 就看到 2 条 → 走 _groupDisjoint → _integrateBatch（不产 integration.start）。
+async function scenarioBatchIntegrate() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'batch a', createdBy: 'test' });
+  store.addItem({ id: 't2', title: 'batch b', createdBy: 'test' });
+  const PORT = 17875;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'batch integrate test', testCmd: null,
+    maxTurns: 8, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 2,
+  });
+  const mk = (item, file) => [
+    `claim ${item}`,
+    `file ${file} content-of-${item}`,
+    'commit batch change',
+    'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+    'say submitted',
+  ].join('\n');
+  runner.echoScripts = { w1: mk('t1', 'src/batch-a.txt'), w2: mk('t2', 'src/batch-b.txt') };
+  // 关键时序：不先启动集成器，等双提交都入队后再启动 → 首轮必走批量路径
+  await runner.spawnWorker('w1');
+  await runner.spawnWorker('w2');
+  await waitFor(() => store.hasQueuedSubmissionForPeer('w1') && store.hasQueuedSubmissionForPeer('w2'),
+    { label: 'both submissions queued', timeoutMs: 60000 });
+  runner.startIntegrator();
+  await waitFor(() => store.item('t1').status === 'done' && store.item('t2').status === 'done',
+    { label: 'batch merged', timeoutMs: 60000 });
+
+  const evs = store.eventsAfter(0, 500);
+  const bs = evs.find((e) => e.type === 'integration.batch_start');
+  const bo = evs.find((e) => e.type === 'integration.batch_ok');
+  check('P1 批量集成：batch_start 两条同批', !!bs && bs.payload.count === 2
+    && bs.payload.peers.includes('w1') && bs.payload.peers.includes('w2'),
+    bs ? JSON.stringify(bs.payload) : '(no batch_start)');
+  check('P1 批量集成：batch_ok 覆盖两 item', !!bo && bo.payload.count === 2
+    && bo.payload.itemIds.includes('t1') && bo.payload.itemIds.includes('t2'),
+    bo ? JSON.stringify(bo.payload) : '(no batch_ok)');
+  check('P1 批量集成：批量路径不产生 integration.start（单条路径专有）',
+    !evs.some((e) => e.type === 'integration.start'));
+  const ps = store.db.prepare("SELECT * FROM context WHERE kind='PATCH_SUMMARY'").all();
+  check('P1 批量集成：一条 PATCH_SUMMARY 概括整批', ps.length === 1 && ps[0].text.includes('batch-merged 2 items'),
+    ps.length ? ps[0].text.slice(0, 120) : '(none)');
+  check('P1 批量集成：两 item 均 done',
+    store.item('t1').status === 'done' && store.item('t2').status === 'done');
+  const files = git(['ls-tree', '-r', '--name-only', 'swarm/integration'], repoDir);
+  check('P1 批量集成：集成分支含两文件', files.includes('src/batch-a.txt') && files.includes('src/batch-b.txt'),
+    files.replace(/\n/g, ','));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 16：P6 毒项熔断——门禁连拒 maxItemFails 次 → failed 终态 ----------
+// maxItemFails=2 + 门禁恒挂：第 1 次拒绝 → retry_backoff（退回 pending 带退避窗口），
+// 第 2 次拒绝 → item.failed 终态（不可再认领、不计 open/claimable）。
+async function scenarioItemFuse() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'), { maxItemFails: 2 });
+  store.addItem({ id: 't1', title: 'poison item', createdBy: 'test' });
+  const PORT = 17874;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'item fuse test', testCmd: 'node -e process.exit(1)',
+    maxTurns: 12, idleTurnsToExit: 99, minWorkers: 1, maxWorkers: 1,
+  });
+  runner.echoScripts = {
+    w1: [
+      'claim t1',
+      'file src/bad.txt oops',
+      'commit bad change',
+      'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+      'say submitted',
+    ].join('\n'),
+  };
+  runner.startIntegrator();
+  await runner.spawnWorker('w1');
+  await waitFor(() => store.item('t1').status === 'failed',
+    { label: 'poison item fused', timeoutMs: 90000 });
+
+  const evs = store.eventsAfter(0, 500);
+  const bo = evs.find((e) => e.type === 'item.retry_backoff');
+  const fe = evs.find((e) => e.type === 'item.failed' && e.payload.itemId === 't1');
+  check('P6 毒项熔断：第 1 次拒绝先退避（fails=1）', !!bo && bo.payload.fails === 1,
+    bo ? JSON.stringify(bo.payload) : '(no retry_backoff)');
+  check('P6 毒项熔断：退避事件早于熔断事件', !!bo && !!fe && bo.id < fe.id);
+  check('P6 毒项熔断：第 2 次拒绝熔断（reason 含 gate rejected 2x）',
+    !!fe && /gate rejected 2x/.test(fe.payload.reason || ''), fe ? fe.payload.reason : '(no item.failed)');
+  check('P6 毒项熔断：item 终态 failed', store.item('t1').status === 'failed');
+  check('P6 毒项熔断：熔断项不再可认领/不占开放数',
+    store.claimableCount() === 0 && store.openCount() === 0,
+    `claimable=${store.claimableCount()} open=${store.openCount()}`);
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 17：P7 预算熔断——token 超预算 → 剩余开放项全部 failed + 软停 ----------
+// echo harness 不产出 usage，手工注入 tokenUsage 让 _tokensSpent() 越过闸门；
+// 不注入 onBudgetExceeded 钩子 → 走 _stopped=true 软停分支。
+async function scenarioBudgetFuse() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'burn tokens', createdBy: 'test' });
+  store.addItem({ id: 't2', title: 'never touched', createdBy: 'test' });
+  const PORT = 17873;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'budget fuse test', testCmd: null, budgetTokens: 1000,
+    maxTurns: 20, idleTurnsToExit: 99, minWorkers: 1, maxWorkers: 1,
+  });
+  runner.echoScripts = {
+    // 脚本必须秒结束：echo 是同步 Node 代码，脚本里的 sleep 会阻塞事件循环，
+    // 连 /claim 的响应回调都得等它跑完——回合内长 sleep 等于把 worker 卡死在回合 1。
+    w1: [
+      'claim t1', // t1 → in_progress 并一直占着（不提交）
+      'say holding',
+    ].join('\n'),
+  };
+  await runner.spawnWorker('w1'); // 不开集成器：本场景与集成无关
+  await waitFor(() => store.item('t1').status === 'in_progress', { label: 't1 claimed' });
+  // 回合 1 结束（t1 占住）→ 注入超额用量 → 回合 2 开工前闸门触发
+  await waitFor(() => store.eventsAfter(0, 200).some((e) => e.type === 'worker.turn_done'),
+    { label: 'first turn done' });
+  runner.tokenUsage.inputTokens = 99999; // 注入超额用量 → 下回合开工前闸门触发
+  await waitFor(() => runner.budgetExceeded === true, { label: 'budget gate tripped', timeoutMs: 30000 });
+
+  const evs = store.eventsAfter(0, 500);
+  const be = evs.find((e) => e.type === 'budget.exceeded');
+  const cb = evs.find((e) => e.type === 'budget.circuit_broken');
+  check('P7 预算熔断：budget.exceeded 记录 spent/budget',
+    !!be && be.payload.spent === 99999 && be.payload.budget === 1000,
+    be ? JSON.stringify(be.payload) : '(no budget.exceeded)');
+  check('P7 预算熔断：circuit_broken 熔断全部 2 个开放项',
+    !!cb && cb.payload.failedItems === 2, cb ? JSON.stringify(cb.payload) : '(no circuit_broken)');
+  check('P7 预算熔断：t1(in_progress)/t2(pending) 均 failed',
+    store.item('t1').status === 'failed' && store.item('t2').status === 'failed');
+  check('P7 预算熔断：无钩子时软停（_stopped=true）', runner._stopped === true);
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 18：P4 上下文治理——容量硬上限 + FACT 豁免 + FACT 兜底 ----------
+// 直连 Store（构造器自动 mkdir）。maxContextRows 最小值 50。
+// 阶段 A：60 条 NOTE → 收敛到 50，最老 10 条淘汰；FACT 在非 FACT 不够删之前豁免。
+// 阶段 B：60 条 FACT → 非 FACT 没得删 → FACT 也按最老淘汰（容量是硬上限）。
+async function scenarioContextPrune() {
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-prune-a-'));
+  const storeA = new Store(path.join(dirA, 'state.db'), { maxContextRows: 50 });
+  for (let i = 0; i < 60; i++) storeA.addContext('test', 'NOTE', `note-${i}`);
+  const cntA = storeA.db.prepare('SELECT COUNT(*) AS n FROM context').get().n;
+  check('P4 治理：灌 60 条 NOTE 后收敛到 50', cntA === 50, `n=${cntA}`);
+  const textsA = new Set(storeA.db.prepare('SELECT text FROM context').all().map((r) => r.text));
+  check('P4 治理：最老 10 条被淘汰', [0, 5, 9].every((i) => !textsA.has(`note-${i}`)));
+  check('P4 治理：新条目存活', textsA.has('note-50') && textsA.has('note-59'));
+  const prunedA = storeA.eventsAfter(0, 500).filter((e) => e.type === 'context.pruned');
+  check('P4 治理：context.pruned 事件记录 removed/kept/max',
+    prunedA.length > 0 && prunedA.every((e) => e.payload.kept === 50 && e.payload.max === 50 && e.payload.removed >= 1),
+    prunedA.length ? JSON.stringify(prunedA[prunedA.length - 1].payload) : '(none)');
+
+  // FACT 豁免：50 条 NOTE 之上再灌 5 FACT + 10 NOTE → 5 条 FACT 全存活，NOTE 只剩 45 条
+  for (let i = 0; i < 5; i++) storeA.addContext('test', 'FACT', `fact-${i}`);
+  for (let i = 60; i < 70; i++) storeA.addContext('test', 'NOTE', `note-${i}`);
+  const factCnt = storeA.db.prepare("SELECT COUNT(*) AS n FROM context WHERE kind='FACT'").get().n;
+  const noteCnt = storeA.db.prepare("SELECT COUNT(*) AS n FROM context WHERE kind='NOTE'").get().n;
+  const cntA2 = storeA.db.prepare('SELECT COUNT(*) AS n FROM context').get().n;
+  check('P4 治理：FACT 豁免（5/5 存活，只淘汰 NOTE）', factCnt === 5 && noteCnt === 45 && cntA2 === 50,
+    `fact=${factCnt} note=${noteCnt} total=${cntA2}`);
+
+  // 阶段 B：全是 FACT 时 FACT 也按最老兜底淘汰
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-prune-b-'));
+  const storeB = new Store(path.join(dirB, 'state.db'), { maxContextRows: 50 });
+  for (let i = 0; i < 60; i++) storeB.addContext('test', 'FACT', `fact-${i}`);
+  const cntB = storeB.db.prepare('SELECT COUNT(*) AS n FROM context').get().n;
+  const textsB = new Set(storeB.db.prepare('SELECT text FROM context').all().map((r) => r.text));
+  check('P4 治理：全 FACT 时容量仍是硬上限（收敛 50）', cntB === 50, `n=${cntB}`);
+  check('P4 治理：FACT 兜底淘汰最老', !textsB.has('fact-0') && !textsB.has('fact-9') && textsB.has('fact-59'));
+
+  storeA.close(); storeB.close();
+  fs.rmSync(dirA, { recursive: true, force: true });
+  fs.rmSync(dirB, { recursive: true, force: true });
+}
+
+// ---------- 场景 14：m5' PATCH_SUMMARY 广播 + m2 ungated trailer ----------
+// 合并成功后共享上下文应出现 PATCH_SUMMARY（含文件名、sha、(ungated)），git 历史带 trailer。
+async function scenarioPatchSummary() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'good patch', createdBy: 'test' });
+  const PORT = 17877;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'patch summary test', testCmd: null, // 无门禁 → ungated
+    maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
+  });
+  runner.echoScripts = {
+    w1: [
+      'claim t1',
+      'file src/good.txt ok',
+      'commit good patch',
+      'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+      'say done',
+    ].join('\n'),
+  };
+  runner.startIntegrator();
+  await runner.spawnWorker('w1');
+  await waitFor(() => store.item('t1').status === 'done', { label: 'item done', timeoutMs: 30000 });
+
+  const ps = store.db.prepare("SELECT * FROM context WHERE kind='PATCH_SUMMARY'").all();
+  check('PATCH_SUMMARY：广播条目存在', ps.length >= 1, `n=${ps.length}`);
+  const txt = ps[0]?.text || '';
+  check('PATCH_SUMMARY：含改动文件名', txt.includes('src/good.txt'), txt.slice(0, 160));
+  check('PATCH_SUMMARY：含集成 sha 前 10 位', /@[0-9a-f]{10}/.test(txt), txt.slice(0, 80));
+  check('PATCH_SUMMARY：无门禁时标记 (ungated)', txt.includes('(ungated)'), txt.slice(0, 120));
+  check('PATCH_SUMMARY：item 已 done', store.item('t1').status === 'done');
+
+  // m2：ungated trailer 进了 git 历史
+  const lastMsg = git(['log', '-1', '--format=%B', 'swarm/integration'], repoDir);
+  check('m2：集成分支最新提交带 Agensh-Integration trailer', /Agensh-Integration:\s*[\w-]+/.test(lastMsg),
+    lastMsg.replace(/\n/g, '\\n'));
+  check('m2：无 testCmd 时带 Agensh-Ungated: true', /Agensh-Ungated:\s*true/.test(lastMsg));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 19：提交后分支被吸收 → stale 拒绝，item 不记 done（修 #4 归因） ----------
+// 复现 tui-demo 事故：item 记 done 但代码没进集成分支（空合并）。w1 提交真实改动；
+// 集成器尚未跑时把 w1 分支 reset 回集成基线（等价 P5 吸收效果）——提交的 commit_sha
+// 不再是分支祖先 → 集成器必须拒绝（stale）而非空合并记 done。
+// 这里由 store 直写入队 submission（带真实 commit_sha），模拟 worker 提交后、集成前的窗口。
+async function scenarioStaleSubmitRejected() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'real change that will be absorbed', createdBy: 'test' });
+  const PORT = 17872;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'stale submit test', testCmd: null,
+    maxTurns: 2, idleTurnsToExit: 99, minWorkers: 0, maxWorkers: 1,
+  });
+  // 手工造一条带真实 commit_sha 的 queued submission：建 w1 worktree、写文件、提交、入队
+  await repo.addWorktree('w1');
+  const wDir = path.join(repoDir, '.swarm', 'worktrees', 'w1');
+  fs.mkdirSync(path.join(wDir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(wDir, 'src', 'real.txt'), 'real-work\n');
+  git(['add', '-A'], wDir);
+  git(['-c', 'user.name=swarm', '-c', 'user.email=swarm@local', 'commit', '-m', 'real change'], wDir);
+  const realSha = git(['rev-parse', 'HEAD'], wDir);
+  // 直接落库 submission（绕过 HTTP，锚定真实 commit_sha）
+  store.db.prepare("INSERT INTO submissions (id, ts, peer, item_id, branch, commit_sha, state, reason) VALUES (?,?,?,?,?,?,?,?)")
+    .run('s-stale-1', Date.now(), 'w1', 't1', 'swarm/w-w1', realSha, 'queued', null);
+  store.db.prepare("UPDATE work_items SET status='submitted' WHERE id='t1'").run();
+  // 提交入队后：把 w1 分支 reset 回集成基线（等价 backupAndResetWorktree 的吸收效果）
+  git(['reset', '--hard', 'swarm/integration'], wDir);
+  runner.startIntegrator();
+  // 集成器应拒绝（stale），item 退回 pending 而非 done
+  await waitFor(() => store.eventsAfter(0, 500).some((e) => e.type === 'integration.stale'),
+    { label: 'stale rejected', timeoutMs: 60000 });
+  const evs = store.eventsAfter(0, 500);
+  check('归因：stale 提交被拒绝（integration.stale 事件）', evs.some((e) => e.type === 'integration.stale'));
+  check('归因：item 未记 done（退回 pending 重试）', store.item('t1').status !== 'done', store.item('t1').status);
+  check('归因：集成记录 merged=0（无空合并）', store.integrations().some((i) => i.merged === 0));
+  check('归因：无空合并 commit 进集成分支', !git(['ls-tree', '-r', '--name-only', 'swarm/integration'], repoDir).includes('src/real.txt'));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
+// ---------- 场景 20：集成前清场——worktree 里的 testCmd 副产物不阻塞 merge（修 #2 脏区） ----------
+// 复现 .pyc 事故：门禁 testCmd 在集成 worktree 里生成 __pycache__/x.pyc 等未跟踪副产物，
+// 若下次 merge 碰到同名 tracked 文件会报 "local changes would be overwritten"。
+// integrate() 合并前必须 reset --hard + clean -fd 清场，merge 照常成功。
+async function scenarioIntegrationCleanSlate() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  store.addItem({ id: 't1', title: 'clean merge', createdBy: 'test' });
+  const PORT = 17871;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'clean slate test', testCmd: null,
+    maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
+  });
+  runner.echoScripts = {
+    w1: [
+      'claim t1',
+      'file src/clean.txt clean-work',
+      'commit clean change',
+      'api POST /submit {"token":"{{token}}","peer":"{{peer}}"}',
+      'say submitted',
+    ].join('\n'),
+  };
+  await runner.spawnWorker('w1');
+  await waitFor(() => store.hasQueuedSubmissionForPeer('w1'), { label: 'submission queued', timeoutMs: 60000 });
+  // 在集成 worktree 里埋脏区：一个未跟踪副产物 + 一个 tracked 文件的本地改动（模拟 testCmd 留下的 .pyc 与脏改）
+  const itDir = repo.ensureIntegrationWorktree();
+  fs.mkdirSync(path.join(itDir, '__pycache__'), { recursive: true });
+  fs.writeFileSync(path.join(itDir, '__pycache__', 'result_validator.cpython-313.pyc'), 'fake-pyc');
+  fs.writeFileSync(path.join(itDir, '.gitignore'), 'DIRTY-LOCAL-CHANGE\n'); // tracked 文件本地改动
+  runner.startIntegrator();
+  await waitFor(() => store.item('t1').status === 'done', { label: 'merged despite dirty worktree', timeoutMs: 60000 });
+  check('清场：脏集成 worktree 不阻塞 merge，item done', store.item('t1').status === 'done');
+  check('清场：集成分支含提交的文件', git(['ls-tree', '-r', '--name-only', 'swarm/integration'], repoDir).includes('src/clean.txt'));
+  check('清场：未跟踪副产物已被 clean 清掉', !fs.existsSync(path.join(itDir, '__pycache__', 'result_validator.cpython-313.pyc')));
+  check('清场：tracked 文件本地改动已被 reset 还原', !String(fs.readFileSync(path.join(itDir, '.gitignore'), 'utf8')).includes('DIRTY-LOCAL-CHANGE'));
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
+
 export async function run() {
   await scenarioGateFail();
   await scenarioGatePass();
@@ -606,6 +1117,16 @@ export async function run() {
   await scenarioJudgeDedup();
   await scenarioReaper();
   await scenarioReaperGuard();
+  await scenarioStructureGate();
+  await scenarioSyncSkew();
+  await scenarioRedoExhausted();
+  await scenarioBatchIntegrate();
+  await scenarioItemFuse();
+  await scenarioBudgetFuse();
+  await scenarioContextPrune();
+  await scenarioPatchSummary();
+  await scenarioStaleSubmitRejected();
+  await scenarioIntegrationCleanSlate();
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
   if (failed.length) throw new Error(`${failed.length} checks failed`);

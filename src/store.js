@@ -46,7 +46,15 @@ function isSubset(a, b) {
 }
 
 export class Store {
-  constructor(dbPath) {
+  // maxItemFails：毒项熔断阈值。同一 item 被门禁拒绝达该次数 → failed 终态，
+  // 不再退回 pending。弱模型会反复产出过不了门禁的工作，指数退避只能延缓
+  // 不能止损；熔断把"无限返工"转成"有界损失"，剩余 worker 转去做别的。
+  // maxContextRows：共享上下文容量上限（f3 上下文治理）。200-1000 agent 下
+  // context 表无限增长会让 searchContext（LIKE 全表扫）越来越慢、digest 窗口
+  // 被陈旧条目占满——新鲜信号（FAIL 教训/BLOCKED 通告）反而挤不进简报。
+  constructor(dbPath, { maxItemFails = 3, maxContextRows = 600 } = {}) {
+    this.maxItemFails = Math.max(1, Number(maxItemFails) || 3);
+    this.maxContextRows = Math.max(50, Number(maxContextRows) || 600);
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     // node:sqlite 没有 pragma() 便捷方法，用 prepare().get() 执行 pragma
@@ -62,6 +70,10 @@ export class Store {
       getEventsAfter: this.db.prepare(
         'SELECT id, ts, peer, type, payload FROM events WHERE id > ? ORDER BY id LIMIT ?'
       ),
+      // 按类型倒序拉最近 N 条事件（crash 统计等场景用）：events 表大，必须走索引 + LIMIT
+      getEventsByType: this.db.prepare(
+        'SELECT id, ts, peer, type, payload FROM events WHERE type = ? ORDER BY id DESC LIMIT ?'
+      ),
       insertItem: this.db.prepare(
         `INSERT INTO work_items (${WORK_ITEM_FIELDS}, dedup_key) VALUES (@id, @parent_id, @title, @detail, @kind, @priority, @status, @created_by, @created_at, @done_at, @not_before, @dedup_key)`
       ),
@@ -72,19 +84,21 @@ export class Store {
       // 用 `IS` 而非 `=`：根级项 parent_id 为 NULL，`= NULL` 永不命中 → 顶层项完全不去重。
       findChildByKey: this.db.prepare(`SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE parent_id IS ? AND dedup_key = ? LIMIT 1`),
       // 语义折叠候选：同一父项下所有未完成的"无文件名"项（t: 键）。
-      // 排除 done：把新任务折进一个已完成项等于静默丢活；宁可多建一项也不能吞掉真活。
+      // 排除 done/failed：把新任务折进已完成项等于静默丢活；折进 failed 项等于
+      // 把活扔进熔断坑（永不再被认领）。宁可多建一项也不能吞掉真活。
       listTextKeySiblings: this.db.prepare(
         `SELECT id, title, dedup_key FROM work_items
-         WHERE parent_id IS ? AND status != 'done' AND dedup_key LIKE 't:%'
+         WHERE parent_id IS ? AND status NOT IN ('done','failed') AND dedup_key LIKE 't:%'
          ORDER BY created_at ASC`
       ),
       // 全局去重（跨父项）：dedupKey 抽出的文件路径是完整相对路径，天然全局唯一。
       // 不同父项下的 N 个 worker 各自"创建 src/m1.js"时，若只看同父项就会各自建项 →
       // N 个 worker 同时改同一个文件（用户观察到的"改到一起去了"）。只匹配未完成项：
-      // 已 done 的文件不折叠，保留"对既有文件做后续改进"的合法任务。
+      // 已 done 的文件不折叠，保留"对既有文件做后续改进"的合法任务；
+      // failed 的也不折叠——熔断后允许用新 item 重新开同一交付物（新尝试、新计数）。
       // 优先返回 pending（可立即认领），避免把 submitted（门禁中，认领必 409）排在前面。
       findOpenByKeyGlobal: this.db.prepare(
-        `SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE dedup_key = ? AND status != 'done'
+        `SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE dedup_key = ? AND status NOT IN ('done','failed')
          ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at ASC LIMIT 1`
       ),
       listItems: this.db.prepare(`SELECT ${WORK_ITEM_FIELDS} FROM work_items ORDER BY priority DESC, created_at ASC`),
@@ -140,10 +154,12 @@ export class Store {
       listQueuedSubmissions: this.db.prepare("SELECT * FROM submissions WHERE state = 'queued' ORDER BY ts ASC"),
       updateSubmissionState: this.db.prepare('UPDATE submissions SET state = ?, reason = ? WHERE id = ?'),
       // 空转抑制用：当前"真正抢得到"的工作项数。条件与 tryClaim 的成功路径严格对齐
-      // （pending + 无子项 + 未在退避窗口 + 无未过期活跃租约），否则 worker 会误判有活可干而白烧一个 LLM 回合。
+      // （pending/in_progress-租约已过期 + 无子项 + 未在退避窗口 + 无未过期活跃租约），
+      // 否则 worker 会误判有活可干而白烧一个 LLM 回合。
       claimableCount: this.db.prepare(
         `SELECT COUNT(*) AS n FROM work_items w
-         WHERE w.status = 'pending'
+         WHERE (w.status = 'pending' OR (w.status = 'in_progress'
+               AND NOT EXISTS (SELECT 1 FROM claims cl2 WHERE cl2.item_id = w.id AND cl2.state = 'active' AND cl2.expires_at > ?)))
            AND (w.not_before IS NULL OR w.not_before <= ?)
            AND NOT EXISTS (SELECT 1 FROM work_items c WHERE c.parent_id = w.id)
            AND NOT EXISTS (SELECT 1 FROM claims cl WHERE cl.item_id = w.id AND cl.state = 'active' AND cl.expires_at > ?)`
@@ -239,6 +255,12 @@ export class Store {
         state TEXT NOT NULL DEFAULT 'queued',
         reason TEXT
       );
+      -- 崩溃续跑用的 mission 元数据：mission 文本、harness、model、testCmd、conventions 等。
+      -- 崩溃后重启 run 时从这里读回，worker 不需要用户重新输入参数。
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_ctx_text ON context(text);
       CREATE INDEX IF NOT EXISTS idx_ctx_item ON context(item_id);
       CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_peer, consumed_by);
@@ -263,12 +285,24 @@ export class Store {
   }
 
   // ---------- 事件日志（append-only） ----------
+  // logHook：可选的旁路输出（如 NDJSON 文件流），由外部注入，失败不影响主流程。
+  setLogHook(fn) { this._logHook = fn; }
   log(peer, type, payload = {}) {
-    const info = this.stmts.insertEvent.run(Date.now(), peer, type, JSON.stringify(payload));
+    const ts = Date.now();
+    const info = this.stmts.insertEvent.run(ts, peer, type, JSON.stringify(payload));
+    if (this._logHook) {
+      try { this._logHook({ ts, peer, type, payload }); } catch { /* 日志旁路失败不影响主流程 */ }
+    }
     return Number(info.lastInsertRowid);
   }
   eventsAfter(lastId, limit = 200) {
     return this.stmts.getEventsAfter.all(lastId, limit).map((r) => ({
+      ...r, payload: JSON.parse(r.payload),
+    }));
+  }
+  // 按类型拉最近 N 条事件（倒序，最新在前）。crash 统计、错误聚合等场景用。
+  eventsByType(type, limit = 200) {
+    return this.stmts.getEventsByType.all(type, limit).map((r) => ({
       ...r, payload: JSON.parse(r.payload),
     }));
   }
@@ -335,6 +369,20 @@ export class Store {
   }
   item(id) { return this.stmts.getItem.get(id); }
   items() { return this.stmts.listItems.all(); }
+  // 自动拆解护栏（任务发散控制）：
+  //   itemCount() — 总 item 数。auto-split 前检查，超过上限就不再拆（熔断释放租约即可）。
+  //   itemDepth(id) — 该项在拆解树里的深度（根=0）。拆到 MAX_SPLIT_DEPTH 层还不完的
+  //     活基本是"不可拆"或"描述不清"，继续拆只会指数级放大 board 而不产生进度。
+  itemCount() { return this.stmts.countItems.get().n; }
+  itemDepth(id) {
+    let depth = 0;
+    let cur = this.stmts.getItem.get(id);
+    while (cur && cur.parent_id && depth < 64) {
+      depth += 1;
+      cur = this.stmts.getItem.get(cur.parent_id);
+    }
+    return depth;
+  }
 
   // ---------- LLM 判官去重的支撑查询（两阶段：廉价召回 → judge 终审） ----------
   // 工业标准模式（CrewAI 0.85 阈值升级 / PD3 / 语义缓存论文均同构）：词法只负责召回候选，
@@ -450,7 +498,9 @@ export class Store {
     const now = Date.now();
     return this._tx(() => {
       const item = this.stmts.getItem.get(itemId);
-      if (!item || item.status !== 'pending') return null;
+      // 只认 pending；in_progress 放行进清理循环——租约过期会在那里退回 pending 并可被再领，
+      // 若在门口就拒掉，过期租约的 item 会永远卡在进行中（没人能再 claim 它）。
+      if (!item || (item.status !== 'pending' && item.status !== 'in_progress')) return null;
       // 已有子项的 item 是"容器"，只负责聚合进度，不可再被认领干活。
       // 否则 N 个 worker 会把同一个大 item 各自重拆一遍，产生几十个重复子项，
       // 父项永远等不齐"所有子项 done"→ 整个任务卡死（EXP4 实测 79 个重复子项、600s 未收敛）。
@@ -459,11 +509,20 @@ export class Store {
       if (item.not_before && item.not_before > now) return null;
       // 清理过期租约
       for (const c of this.stmts.activeClaim.all(itemId)) {
-        if (c.expires_at < now) this.stmts.expireClaim.run(c.token);
+        if (c.expires_at < now) {
+          this.stmts.expireClaim.run(c.token);
+          // 租约过期但 item 还停在 in_progress：退回 pending，否则没人再 claim 它
+          // （tryClaim 只认 pending）会永远卡在进行中。
+          if (item.status === 'in_progress') {
+            this._setStatus(itemId, 'pending');
+            this.log(peer, 'item.lease_expired', { itemId });
+          }
+        }
         else return null; // 已有活跃租约
       }
       const token = `c${crypto.randomBytes(6).toString('hex')}`;
       this.stmts.insertClaim.run(itemId, peer, token, 'active', now, now + leaseSec * 1000);
+      this._setStatus(itemId, 'in_progress'); // 有活跃租约 = 正在做：/status 与 dashboard 的 inProgress 不再恒 0
       this.log(peer, 'item.claimed', { itemId, token, leaseSec });
       return token;
     });
@@ -489,7 +548,24 @@ export class Store {
     const r = this.stmts.renewClaim.run(Date.now() + leaseSec * 1000, token);
     return r.changes > 0;
   }
-  release(token) { this.stmts.releaseClaim.run(token); }
+  // 释放租约：无其他活跃租约时同步把 in_progress 项退回 pending——
+  // release 是 claim 的逆操作，状态机必须对称，否则 item 卡在进行中没人能再领。
+  release(token) {
+    const c = this.db.prepare('SELECT item_id FROM claims WHERE token = ?').get(token);
+    this.stmts.releaseClaim.run(token);
+    if (c) this.releaseItemIfInProgress(c.item_id);
+  }
+  // 释放租约后把无主 in_progress 项退回 pending（worker 退场/崩溃清理用）。
+  // 原子性：该项已无其他活跃租约才退，避免误伤同 item 上别人的有效租约。
+  releaseItemIfInProgress(itemId) {
+    return this._tx(() => {
+      const item = this.stmts.getItem.get(itemId);
+      if (!item || item.status !== 'in_progress') return false;
+      if (this.stmts.activeClaim.all(itemId).length > 0) return false;
+      this._setStatus(itemId, 'pending');
+      return true;
+    });
+  }
   activeClaims() { return this.db.prepare("SELECT * FROM claims WHERE state='active' AND expires_at > ?").all(Date.now()); }
   // 某 peer 当前持有的活跃租约（自动续期用）
   activeClaimsByPeer(peer) {
@@ -503,8 +579,33 @@ export class Store {
       peer, kind, item_id: itemId, text, tags: tags.join(','),
     };
     this.stmts.insertContext.run(row);
+    // 写入即治理：每次追加后检查容量（COUNT 在本表规模下是微秒级），
+    // 保证表大小是收敛的而不是"等谁想起来再清理"。
+    this.pruneContext();
     this.log(peer, 'context.added', { kind, itemId, text: text.slice(0, 120) });
     return row.id;
+  }
+  // 上下文治理：超出容量上限时按 ts 升序淘汰最老的非 FACT 条目。
+  // FACT（任务级事实：接口契约、命名约定、环境约束）豁免——淘汰它会让
+  // 后面的 worker 重复踩坑，教训比新近性更重要。但容量是硬上限：
+  // 若非 FACT 不够删（表里几乎全是 FACT），FACT 也按最老淘汰，防止 FACT 泛滥占满表。
+  pruneContext() {
+    const cnt = this.db.prepare('SELECT COUNT(*) AS n FROM context').get().n;
+    if (cnt <= this.maxContextRows) return 0;
+    const delNonFact = this.db.prepare(
+      "DELETE FROM context WHERE id IN (SELECT id FROM context WHERE kind != 'FACT' ORDER BY ts ASC LIMIT ?)"
+    );
+    const delFact = this.db.prepare(
+      "DELETE FROM context WHERE id IN (SELECT id FROM context WHERE kind = 'FACT' ORDER BY ts ASC LIMIT ?)"
+    );
+    const count = this.db.prepare('SELECT COUNT(*) AS n FROM context');
+    let removed = delNonFact.run(cnt - this.maxContextRows).changes;
+    let left = count.get().n;
+    if (left > this.maxContextRows) {
+      removed += delFact.run(left - this.maxContextRows).changes;
+    }
+    if (removed > 0) this.log('store', 'context.pruned', { removed, kept: count.get().n, max: this.maxContextRows });
+    return removed;
   }
   searchContext(query, limit = 30) {
     const esc = query.replace(/[\\%_]/g, (m) => '\\' + m);
@@ -566,15 +667,57 @@ export class Store {
       if (!item) return false;
       this._setStatus(itemId, 'done');
       this.log(peer, 'item.done', { itemId, commitSha });
-      // 父项级联：所有兄弟子项 done → 父项 done
-      if (item.parent_id) {
-        const siblings = this.db.prepare('SELECT status FROM work_items WHERE parent_id = ?').all(item.parent_id);
-        if (siblings.length > 0 && siblings.every((s) => s.status === 'done')) {
-          this._setStatus(item.parent_id, 'done');
-          this.log(peer, 'item.done.auto', { itemId: item.parent_id });
-        }
-      }
+      this._cascadeParent(item, peer, 'done');
       return true;
+    });
+  }
+
+  // 毒项熔断 / 预算收尾用：置 failed 终态并级联父项。failed 项不可认领
+  // （tryClaim 只认 pending/in_progress）、不计 openCount，等价于"止损出局"。
+  failItem(itemId, peer, reason = null) {
+    return this._tx(() => {
+      const item = this.stmts.getItem.get(itemId);
+      if (!item || item.status === 'done' || item.status === 'failed') return false;
+      this._setStatus(itemId, 'failed');
+      this.log(peer, 'item.failed', { itemId, reason });
+      this._cascadeParent(item, peer, 'failed');
+      return true;
+    });
+  }
+
+  // 父项级联：所有子项达终态（done 或 failed）时父项也达终态——
+  // 全 done → done（正常收敛）；含 failed → failed（如实反映有损失，不装作完成）。
+  // 不达终态则父项保持原状继续等。这是"含失败子项的父项永远等不齐"的防护。
+  _cascadeParent(item, peer, status) {
+    if (!item.parent_id) return;
+    const siblings = this.db.prepare('SELECT status FROM work_items WHERE parent_id = ?').all(item.parent_id);
+    if (siblings.length === 0) return;
+    const settled = (st) => st === 'done' || st === 'failed';
+    if (!siblings.every((s) => settled(s.status))) return;
+    const allDone = siblings.every((s) => s.status === 'done');
+    const parentStatus = allDone ? 'done' : 'failed';
+    const parent = this.stmts.getItem.get(item.parent_id);
+    if (!parent || parent.status === parentStatus) return;
+    this._setStatus(item.parent_id, parentStatus);
+    this.log(peer, allDone ? 'item.done.auto' : 'item.failed.auto', { itemId: item.parent_id, via: status });
+  }
+
+  // 预算熔断收尾（f5）：把所有开放项（pending/in_progress/submitted）标 failed。
+  // 优雅退出前必须清零 open，否则 worker 继续认领白烧 token、autoscaler 误判还有活。
+  // submitted 也标 failed 是安全的：此后 resolveSubmission 的 rejected 路径因
+  // status 已非 submitted 而跳过重置（不会复活已熔断项）；merged 路径走
+  // completeItem 会把 failed 改回 done——集成已通过的工作是既成事实，预算否定不了它。
+  failAllOpenItems(peer, reason = null) {
+    return this._tx(() => {
+      const rows = this.db.prepare(
+        "SELECT id FROM work_items WHERE status IN ('pending','in_progress','submitted')"
+      ).all();
+      let n = 0;
+      for (const r of rows) {
+        if (this.failItem(r.id, peer, reason)) n += 1;
+      }
+      if (n > 0) this.log(peer, 'items.failed.bulk', { count: n, reason });
+      return n;
     });
   }
 
@@ -588,7 +731,7 @@ export class Store {
     const itemId = fence.item_id;
     const r = this._tx(() => {
       const item = this.stmts.getItem.get(itemId);
-      if (!item || item.status !== 'pending') return null;
+      if (!item || (item.status !== 'pending' && item.status !== 'in_progress')) return null;
       this._setStatus(itemId, 'submitted');
       const sid = `s${crypto.randomBytes(5).toString('hex')}`;
       this.stmts.insertSubmission.run(sid, Date.now(), peer, itemId, `swarm/w-${peer}`, commitSha, 'queued', null);
@@ -617,14 +760,21 @@ export class Store {
       } else {
         const item = this.stmts.getItem.get(s.item_id);
         if (item && item.status === 'submitted') {
-          // 指数退避：同一 item 连续失败越多次，退避越久，避免弱模型陷入"失败→立即重试"死循环。
           const fails = this.db.prepare(
             "SELECT COUNT(*) AS n FROM submissions WHERE item_id = ? AND state = 'rejected'"
           ).get(s.item_id).n;
-          const backoffMs = Math.min(60000, 5000 * Math.pow(2, Math.min(fails, 4)));
-          this.db.prepare('UPDATE work_items SET status = ?, not_before = ? WHERE id = ?')
-            .run('pending', Date.now() + backoffMs, s.item_id);
-          this.log(s.peer, 'item.retry_backoff', { itemId: s.item_id, fails, backoffMs });
+          // 毒项熔断：连续被拒达阈值 → failed 终态，不再退回 pending。
+          // 弱模型的"失败→退避→重试"循环只烧 token 不产进度；熔断后该项
+          // 不计入 openCount/claimableCount（无人再领），其他 worker 转去做别的活。
+          if (fails >= this.maxItemFails) {
+            this.failItem(s.item_id, s.peer, `gate rejected ${fails}x: ${reason || 'unknown'}`);
+          } else {
+            // 指数退避：同一 item 连续失败越多次，退避越久，避免弱模型陷入"失败→立即重试"死循环。
+            const backoffMs = Math.min(60000, 5000 * Math.pow(2, Math.min(fails, 4)));
+            this.db.prepare('UPDATE work_items SET status = ?, not_before = ? WHERE id = ?')
+              .run('pending', Date.now() + backoffMs, s.item_id);
+            this.log(s.peer, 'item.retry_backoff', { itemId: s.item_id, fails, backoffMs });
+          }
         }
       }
       this.log(s.peer, 'submission.resolved', { submissionId, ok, reason });
@@ -641,15 +791,19 @@ export class Store {
   _replay() {
     const STATUS_OF_EVENT = {
       'item.added': 'pending',
+      'item.claimed': 'in_progress',
+      'item.lease_expired': 'pending',
       'item.submitted': 'submitted',
       'item.retry_backoff': 'pending',
       'item.done': 'done',
       'item.done.auto': 'done',
+      'item.failed': 'failed',
+      'item.failed.auto': 'failed',
     };
     const expect = new Map();
     try {
       const rows = this.db.prepare(
-        "SELECT type, payload FROM events WHERE type IN ('item.added','item.submitted','item.retry_backoff','item.done','item.done.auto') ORDER BY id"
+        "SELECT type, payload FROM events WHERE type IN ('item.added','item.claimed','item.lease_expired','item.submitted','item.retry_backoff','item.done','item.done.auto','item.failed','item.failed.auto') ORDER BY id"
       ).all();
       for (const r of rows) {
         let p; try { p = JSON.parse(r.payload); } catch { continue; }
@@ -673,7 +827,13 @@ export class Store {
   // 刻意不放进构造函数：swarm status / board 会打开同一个库，那样会误杀正在跑的租约。
   releaseOrphanClaims() {
     const n = this.db.prepare("UPDATE claims SET state = 'expired' WHERE state = 'active'").run().changes;
-    if (n > 0) this.log('store', 'recover.orphan_claims', { count: n });
+    // 孤儿租约对应的 in_progress 项一并退回 pending（claim 现在会写 in_progress），
+    // 否则崩溃后这些项卡在进行中直到有人再 tryClaim 它才被惰性纠正。
+    if (n > 0) {
+      const stuck = this.db.prepare("SELECT DISTINCT w.id FROM work_items w WHERE w.status = 'in_progress' AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.item_id = w.id AND c.state = 'active')").all();
+      for (const s of stuck) this._setStatus(s.id, 'pending');
+      if (stuck.length) this.log('store', 'recover.stuck_in_progress', { count: stuck.length });
+    }
     return n;
   }
 
@@ -686,6 +846,7 @@ export class Store {
     return {
       total, pending: by.pending || 0, submitted: by.submitted || 0,
       done: by.done || 0, inProgress: by.in_progress || 0,
+      failed: by.failed || 0,
     };
   }
 
@@ -712,7 +873,21 @@ export class Store {
   // pending + 无子项（容器不可认领）+ 未在退避窗口 + 无未过期活跃租约。
   claimableCount() {
     const now = Date.now();
-    return this.stmts.claimableCount.get(now, now).n;
+    return this.stmts.claimableCount.get(now, now, now).n;
+  }
+  // ---------- KV（mission 元数据持久化，崩溃续跑用） ----------
+  setKv(key, value) {
+    this.db.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, typeof value === 'string' ? value : JSON.stringify(value));
+  }
+  getKv(key) {
+    const r = this.db.prepare('SELECT value FROM kv WHERE key = ?').get(key);
+    return r ? r.value : null;
+  }
+  getKvJson(key) {
+    const v = this.getKv(key);
+    if (v == null) return null;
+    try { return JSON.parse(v); } catch { return null; }
   }
   close() { this.db.close(); }
 }

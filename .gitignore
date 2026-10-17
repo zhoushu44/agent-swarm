@@ -12,8 +12,42 @@ api.json
 .env.*
 *.key
 *.pem
+*.crt
+*.pfx
 
 # 日志与临时产物
 *.log
 *.tmp
+*.bak
 .DS_Store
+
+# 测试/调试临时文件（项目根目录）
+tmp/
+test/tmp/
+*.ndjson
+repro*.mjs
+run-*.ps1
+gate2.txt
+
+# 测试调试脚本（probe/check/verify）
+test/*-probe.mjs
+test/*-check.mjs
+test/*-verify.mjs
+test/db-*.mjs
+test/which-db.mjs
+test/seed-d*.json
+test/speed-verify-seed.json
+test/main-branch-test.mjs
+test/nuke-hardening-test.mjs
+test/seed-d4b-apply.mjs
+
+# 压测/验证产物
+stress-*/
+verify-*/
+demo-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

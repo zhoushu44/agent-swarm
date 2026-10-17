@@ -6,6 +6,255 @@
 架构基座来自微软 Agensh 论文（arXiv:2609.26781v1）的自组织多 agent harness：
 共享 workspace + 消息接口 + append-only 共享上下文数据库，配合"五步合作循环"。
 
+---
+
+## 给别人用（5 分钟上手）
+
+### 前置要求
+
+- **Node.js** ≥ 18（推荐 20+）
+- **Git** ≥ 2.30
+- **Claude Code** 或其他支持 skill 的 AI 编码工具（推荐）
+- **Anthropic 兼容 API**（中转站或官方 API）
+
+### 安装
+
+```bash
+# 1. 克隆仓库
+git clone <repo-url> swarm
+cd swarm
+
+# 2. 安装依赖（只有 better-sqlite3 一个原生依赖）
+npm install
+
+# 3. 配置 API（三选一）
+# 方式 1：环境变量（推荐）
+export SWARM_API_BASE="https://your-relay.com/v1"
+export SWARM_API_KEY="sk-..."
+export SWARM_MODEL="cn:claude-sonnet-4"
+
+# 方式 2：配置文件
+mkdir ~/.swarm
+cat > ~/.swarm/api.json <<EOF
+{
+  "baseUrl": "https://your-relay.com/v1",
+  "apiKey": "sk-...",
+  "model": "cn:claude-sonnet-4"
+}
+EOF
+
+# 方式 3：命令行参数（每次 run 时传 --api-base / --api-key / --model）
+```
+
+### 使用方式：通过 skill（强烈推荐）
+
+swarm **专门设计为通过 AI 编码工具的 skill 调用**，不要手动敲 CLI。
+
+#### skill 功能说明
+
+swarm skill 提供 **7 大核心能力**：
+
+1. **任务拆解**：把一句话 mission（如"实现一个 TODO CLI"）自动拆成 N 个子任务（默认 6 个）
+2. **并行执行**：拉起 N 个独立 worker（默认 8 个，最多 1000 个），每个 worker 自己认领任务、写代码、跑测试
+3. **自动集成**：worker 提交代码后，集成器自动 merge 到主分支，跑测试门禁，失败自动回滚
+4. **冲突处理**：
+   - scratch 文件拦截（拒绝 `probe.*` / `tmp_*` / `*.log` 等调试文件）
+   - 文本清单合并（`LICENSE` / `.gitignore` 等白名单文件的 add/add 冲突自动合并）
+   - LLM 三路仲裁（源码冲突时让 LLM 裁决合并）
+5. **崩溃续跑**：中途崩溃后重新 `run <repoDir>`（不传参数）自动从断点续跑
+6. **实时监控**：跑到 `http://127.0.0.1:17771/dashboard` 看进度 / 树状分解 / token 用量 / 集成记录
+7. **错误观测**：worker 崩溃按类型聚合（network / rate_limit / timeout 等），`status` 命令查看 `crashStats`
+
+**触发条件**：用户在 Claude Code 里说以下任一句话，skill 自动激活：
+- "并行开发" / "多 agent" / "拆分任务" / "swarm"
+- "用 swarm 实现 XXX" / "让 swarm 做 XXX"
+- "把 XXX 拆给多个 agent 并行做"
+- "调用 swarm 帮我完成 XXX"
+
+**首次使用前自动检查**：skill 文件里内置了安装检查逻辑，Claude Code 第一次调用时会自动验证：
+- swarm 仓库是否存在
+- 依赖是否安装（`node_modules/better-sqlite3`）
+- API 配置是否就绪（环境变量 / `~/.swarm/api.json` / 命令行参数）
+
+如果检查失败，Claude Code 会自动引导用户完成安装。
+
+#### Claude Code skill（推荐）
+
+**一键安装**：
+
+```bash
+# 在 swarm 仓库根目录执行
+node scripts/install-skill.js
+```
+
+这个脚本会：
+1. 检测 Claude Code 配置目录（`~/.config/claude-code/skills`）
+2. 创建 `swarm.md` skill 文件（自动填入当前 swarm 仓库路径）
+3. 验证 API 配置（`~/.swarm/api.json` 或环境变量）
+4. 如果没装依赖，自动跑 `npm install`
+
+**手动安装**（如果脚本不存在）：
+
+```bash
+# 1. 创建 skill 目录
+mkdir -p ~/.config/claude-code/skills
+
+# 2. 创建 skill 文件（注意替换 <SWARM_PATH> 为实际路径）
+cat > ~/.config/claude-code/skills/swarm.md <<'EOF'
+---
+name: swarm
+description: 去中心化多 agent 并行开发。把大任务拆给 N 个 agent 并行完成，自动集成、测试、合并。
+---
+
+# swarm skill
+
+当用户要求"并行开发"、"多 agent"、"拆分任务"、"swarm"时，调用此 skill。
+
+## 首次使用前检查
+
+在调用任何 swarm 命令前，**必须先检查安装状态**：
+
+```bash
+# 1. 检查 swarm 仓库是否存在
+ls <SWARM_PATH>/cli.js
+
+# 2. 检查依赖是否安装
+ls <SWARM_PATH>/node_modules/better-sqlite3
+
+# 3. 检查 API 配置（三选一）
+# - 环境变量：SWARM_API_BASE + SWARM_API_KEY
+# - 配置文件：~/.swarm/api.json
+# - 命令行参数：--api-base + --api-key
+
+# 如果任何检查失败，先执行安装：
+cd <SWARM_PATH> && npm install
+# 然后配置 API（见 README）
+```
+
+## 用法
+
+用户提供：
+- `repoDir`：目标项目目录（绝对路径）
+- `mission`：任务描述（一句话）
+- `testCmd`（可选）：集成门禁测试命令（如 `npm test`）
+- `maxWorkers`（可选）：worker 数上限（默认 8）
+
+## 执行步骤
+
+1. **检查安装**（首次必须）：
+   ```bash
+   ls <SWARM_PATH>/cli.js && ls <SWARM_PATH>/node_modules
+   ```
+
+2. 初始化：
+   ```bash
+   node <SWARM_PATH>/cli.js init <repoDir>
+   ```
+
+3. 播种：
+   ```bash
+   node <SWARM_PATH>/cli.js seed <repoDir> --mission "<mission>" --count 6
+   ```
+
+4. 开跑：
+   ```bash
+   node <SWARM_PATH>/cli.js run <repoDir> --harness direct \
+     --mission "<mission>" \
+     --test-cmd "<testCmd>" \
+     --max-workers <maxWorkers> \
+     --exit-when-done
+   ```
+
+5. 监控：打开 `http://127.0.0.1:17771/dashboard`
+
+## 注意事项
+
+- `<SWARM_PATH>` 是 swarm 仓库的绝对路径（安装时自动填入）
+- 跑完后自动退出（`--exit-when-done`）
+- 崩溃了直接重新 `run <repoDir>`（不传参数）自动续跑
+- **首次使用前必须检查安装**（见上方"首次使用前检查"）
+EOF
+
+# 3. 替换 <SWARM_PATH> 为实际路径（比如）
+sed -i "s|<SWARM_PATH>|$(pwd)|g" ~/.config/claude-code/skills/swarm.md  # macOS/Linux
+# Windows PowerShell:
+# (Get-Content ~/.config/claude-code/skills/swarm.md) -replace '<SWARM_PATH>', (Get-Location).Path | Set-Content ~/.config/claude-code/skills/swarm.md
+```
+
+**使用**：
+
+在 Claude Code 里输入：
+```
+/swarm 帮我实现一个 TODO CLI，项目目录是 C:/Users/zs/projects/my-todo
+```
+
+Claude Code 会：
+1. 读取 `~/.config/claude-code/skills/swarm.md`
+2. 按 skill 里的"首次使用前检查"验证安装
+3. 如果没装依赖，提示你先跑 `npm install`
+4. 如果装好了，自动执行 init → seed → run → 打开 dashboard
+
+#### 其他 AI 工具（Cursor / Windsurf / 自研）
+
+只要支持"调用外部命令"的 AI 工具都能用。在 AI 工具的 prompt 里告诉它：
+
+```
+当用户要求并行开发时：
+
+1. 首次使用前检查：
+   - 检查 swarm 仓库是否存在：ls /path/to/swarm/cli.js
+   - 检查依赖是否安装：ls /path/to/swarm/node_modules
+   - 如果没装，先执行：cd /path/to/swarm && npm install
+
+2. 执行命令：
+   node /path/to/swarm/cli.js init <repoDir>
+   node /path/to/swarm/cli.js seed <repoDir> --mission '<mission>'
+   node /path/to/swarm/cli.js run <repoDir> --harness direct --mission '<mission>' --test-cmd 'npm test' --max-workers 8 --exit-when-done
+```
+
+### 使用方式：直接 CLI（仅调试）
+
+如果不用 skill，也可以直接敲命令：
+
+```bash
+# 1. 初始化
+node cli.js init ../my-project
+
+# 2. 播种
+node cli.js seed ../my-project --mission "实现一个 TODO CLI" --count 6
+
+# 3. 开跑
+node cli.js run ../my-project --harness direct \
+  --mission "实现一个 TODO CLI" \
+  --test-cmd "npm test" \
+  --max-workers 8 \
+  --exit-when-done
+
+# 4. 查看状态
+node cli.js board ../my-project
+node cli.js status ../my-project
+```
+
+### 监控
+
+跑到 `http://127.0.0.1:17771/dashboard` 看实时面板（进度 / 树状分解 / token 用量 / 集成记录）。
+
+### 常见问题
+
+**Q: 跑一半崩溃了怎么办？**  
+A: 直接 `node cli.js run ../my-project`（不传任何参数），自动从上次断点续跑。
+
+**Q: 怎么知道 worker 为什么挂了？**  
+A: `node cli.js status ../my-project` 看 `crashStats` 字段，按错误类型聚合（network / rate_limit / timeout 等）。
+
+**Q: 集成冲突太多怎么办？**  
+A: swarm 会自动处理三类冲突（scratch 文件拦截 / 文本清单合并 / LLM 三路仲裁），如果还是频繁失败，检查 mission 拆解粒度是否太细。
+
+**Q: 成本多少？**  
+A: 实测 100 workers 跑一个中等 mission（39 任务、296 测试）约 600M tokens，按中转站定价约 ¥500-2000。
+
+---
+
 ## 设计约束（硬性）
 
 - **全并发**：没有全局 barrier，没有"等所有 agent 到齐再继续"的阶段。
@@ -57,6 +306,7 @@ node cli.js status ../my-project
 | `--max-turns N` | `10` | 每个 worker 最多跑几个回合 |
 | `--test-cmd "..."` | — | 集成门禁测试命令；通过才保留合并，失败自动回滚 |
 | `--max-inflight N` | `64` | 全局在飞 API 请求上限（见下） |
+| `--max-items N` | `200` | 任务发散护栏：总 item 数达到上限后停止 auto-split |
 | `--plan` | off | board 为空时先自动规划首批工作项再开跑 |
 | `--port N` | `17771` | 协调 API 与 dashboard 端口 |
 | `--conventions FILE` | — | 项目规范文本，注入每个 worker 的 prompt |
@@ -115,6 +365,8 @@ autoscaler 是独立异步循环，只看 board 计数（不看内容）：
 - `releaseOrphanClaims()`：`run` 启动时（尚无 worker 存活）把上次进程崩溃留下的活跃租约全部作废，
   否则对应项要干等租约自然过期才能被重认领。
 - `recoverIntegrations()`：扫集成分支的 `Agensh-Integration:` trailer，补回"已 merge 但崩溃在落库之前"的集成记录。
+- **持久化续跑**（2026-10 新增）：`run` 启动时把 mission/testCmd/harness/model/maxWorkers 等元数据写进 `kv` 表；
+  崩溃后再次 `swarm run <dir>`（不传任何参数）自动从 kv 读回，接力未完成的 mission。
 
 > 恢复只在 `run` 启动时执行，刻意不放进 Store 构造函数——`status`/`board` 会打开同一个库，放构造函数会误杀正在跑的租约。
 
@@ -127,6 +379,47 @@ worker prompt 的正文段对所有 worker **逐字节相同**（身份/端口/t
 ### 空转抑制
 
 worker 手头无租约、board 也无 claimable 项时退避轮询，不烧 LLM 回合；冷启动（`total === 0`）豁免。
+
+## 质量护栏（2026-10 新增）
+
+### 集成门禁增强
+
+- **scratch 文件拦截**：集成时按文件名模式拦截调试/临时文件（`probe.*` / `tmp_*` / `*.log` / `scratch/` 等），拒绝整个 merge；worker 在 CONFLICT 简报里看到文件名，下回合清理后重新提交。
+- **无测试文件跳过**：`node --test test/*.test.js` 这类门禁在 test 目录为空时直接放行（输出 `(skipped: no test files yet)`），等真实测试落地后再门禁——避免 src 模块先于 test 提交时的时序性空跑。
+- **文本清单合并**：`LICENSE` / `.gitignore` / `.npmrc` 等白名单文件的 add/add 冲突做行级去重并集合并（不再回滚让 worker 重试）。
+- **LLM 三路仲裁**：白名单外的源码冲突（两个 worker 同时改 `utils.js`）先跑 `git merge-file` 三路合并；有冲突块时把 base/ours/theirs 发给 LLM 裁决，输出必须通过 `node --check` 语法校验。单次最多仲裁 3 个文件（防无限烧 token）。
+
+### 任务发散护栏
+
+- **auto-split 上限**：总 item 数达到 `maxItems`（默认 200，`--max-items` 覆盖）后停止拆解，仅熔断释放。
+- **拆解树深度上限**：4 层，防止无限拆解。
+- **事件**：`worker.item_split_capped` 记录被拦截的拆解尝试。
+
+### prompt 治理
+
+- **RULES 注册表**：HARD RULES 从硬编码字符串改成结构化注册表（每条规则带 ID/priority/category/rationale）。
+- **冲突检测**：`validateRules()` 在 `run` 启动时检测两类冲突（同 category 同 priority 过多、ALWAYS vs NEVER 关键词互斥），warnings 打印、errors 退出。
+- **barrel 延后**：planner prompt 新增规则 "AGGREGATOR/BARREL files LAST"——index.js/README.md 这类只负责 re-export 的汇总文件必须最后做，避免依赖未就绪时反复重写。
+
+### 错误观测
+
+- **错误分类**：`_classifyError(e)` 把无结构的 Error 消息聚类成 10 个桶（network / rate_limit / auth / api_5xx / timeout / disk_full / permission / git / config / parse / unknown）。
+- **事件**：`worker.crashed` 带 `category` 字段。
+- **聚合统计**：`status()` 输出 `crashStats`（按 category 聚合），100 workers 挂了 5 个直接看到 `{"network": 3, "rate_limit": 2}` 而不是 5 条无结构文本。
+
+## 资源隔离演进路线
+
+单进程 Node 现在（100-200 workers）够用，500+ workers 会撞墙（事件循环瓶颈、内存泄漏传染、SQLite 锁竞争、子进程爆炸）。
+
+**分阶段演进**（详见 [docs/RESOURCE_ISOLATION.md](docs/RESOURCE_ISOLATION.md)）：
+
+| 阶段 | worker 数 | 架构 | 工作量 | 现状 |
+|---|---|---|---|---|
+| 1️⃣ | ≤ 200 | 单进程 Node | 已完成 | ✅ 稳定运行 |
+| 2️⃣ | 200-800 | worker_threads | 1-2 天 | 🔲 需要时再做 |
+| 3️⃣ | 1000+ | Go 重写 | 1-2 周 | 🔲 远期目标 |
+
+**不要现在换 Go**——等实测撞到墙了再升级。
 
 ## harness 一览
 
@@ -153,7 +446,7 @@ worker 手头无租约、board 也无 claimable 项时退避轮询，不烧 LLM 
 
 ## 状态与文件布局
 
-- 状态库：`<repoDir>/.swarm/state.db`（SQLite）。表：`work_items` / `claims` / `submissions` / `integrations` / `context` / `messages` / `events`。
+- 状态库：`<repoDir>/.swarm/state.db`（SQLite）。表：`work_items` / `claims` / `submissions` / `integrations` / `context` / `messages` / `events` / `kv`（持久化续跑元数据）。
 - 集成分支：`swarm/integration`；每个 worker 一个 git worktree + 分支，退场后由 reaper 回收。
 
 ## HTTP API

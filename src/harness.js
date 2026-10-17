@@ -22,7 +22,7 @@ const resolveMaxInflight = () => {
 };
 
 class Semaphore {
-  constructor(limit) { this.limit = limit; this.active = 0; this.queue = []; }
+  constructor(limit) { this.limit = limit; this.ceiling = limit; this.active = 0; this.queue = []; this._okStreak = 0; }
   async acquire() {
     if (this.limit <= 0) return; // 不限流
     if (this.active < this.limit) { this.active += 1; return; }
@@ -37,8 +37,22 @@ class Semaphore {
   }
   setLimit(n) {
     this.limit = n;
+    if (n > this.ceiling) this.ceiling = n; // 显式调高上限时同步抬高天花板
     // 放宽上限时把等待队列唤醒（多余的 resolve 会被 acquire 重新按新上限排队，不会超发）
     if (n > 0) while (this.queue.length > 0 && this.active < this.limit) this.queue.shift()();
+  }
+  // 自适应并发（AIMD）：撞限流 → 上限乘性回退（0.75x）迅速卸压；连续成功 → 每 8 次
+  // 加性回升 1，缓慢逼近天花板。上限永不超过 ceiling（= 初始/显式设定值）。
+  // 目的：worker 数远超中转站真实并发时，靠反馈自动收敛，而不是固定 64 硬扛或超发。
+  noteRateLimit() {
+    if (this.limit <= 0) return;
+    this._okStreak = 0;
+    this.setLimit(Math.max(1, Math.floor(this.limit * 0.75)));
+  }
+  noteOk() {
+    if (this.limit <= 0 || this.limit >= this.ceiling) return;
+    this._okStreak += 1;
+    if (this._okStreak >= 8) { this._okStreak = 0; this.setLimit(this.limit + 1); }
   }
 }
 const apiGate = new Semaphore(resolveMaxInflight());
@@ -51,8 +65,13 @@ export function setMaxInflight(n) {
 // 供测试/监控读取当前在飞数
 export const apiInflight = () => ({ active: apiGate.active, queued: apiGate.queue.length, limit: apiGate.limit });
 
-export function run(argv, { cwd, timeoutMs = 900000, env = {}, signal } = {}) {
-  return new Promise((resolve) => {
+export async function run(argv, { cwd, timeoutMs = 900000, env = {}, signal, onLine } = {}) {
+  // 过闸：CLI harness（pi/claude/codex）每回合 spawn 一个子进程，子进程内的 agent loop
+  // 串行发 API 请求 → 1 个活进程 ≤ 1 条在飞请求。占用进程存活期，让 apiInflight 的
+  // active 反映真实并发（widget 的"并发 N/限"），max-inflight 对 CLI harness 也真正生效。
+  await apiGate.acquire();
+  try {
+    return await new Promise((resolve) => {
     const child = spawn(argv[0], argv.slice(1), {
       cwd, shell: false,
       env: { ...process.env, ...env },
@@ -62,6 +81,20 @@ export function run(argv, { cwd, timeoutMs = 900000, env = {}, signal } = {}) {
     // 我们从不写 stdin，不主动关掉子进程就会永久挂起。立刻 end 等于"空输入"。
     try { child.stdin.end(); } catch { /* 已销毁则忽略 */ }
     let out = '', err = '', timer = null, timedOut = false, aborted = false;
+    // 流式行缓冲：stdout 分片到达，NDJSON 一行一个 JSON 事件。攒到换行就把完整行
+    // 喂给 onLine（实时记账用），全量缓存 out 的行为保持不变（结束时仍要整包解析回复）。
+    let lineBuf = '';
+    const feed = (d) => {
+      out += d;
+      if (!onLine) return;
+      lineBuf += d;
+      let i;
+      while ((i = lineBuf.indexOf('\n')) >= 0) {
+        const line = lineBuf.slice(0, i);
+        lineBuf = lineBuf.slice(i + 1);
+        try { onLine(line); } catch { /* 记账回调抛错不能杀子进程 */ }
+      }
+    };
     const kill = () => { try { child.kill(); } catch {} };
     timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);
     // 外部中止通道：runner.stop() 时立刻杀掉子进程，避免 drain 卡到超时
@@ -70,7 +103,7 @@ export function run(argv, { cwd, timeoutMs = 900000, env = {}, signal } = {}) {
       if (signal.aborted) onAbort();
       else signal.addEventListener('abort', onAbort, { once: true });
     }
-    child.stdout.on('data', (d) => { out += d; });
+    child.stdout.on('data', feed);
     child.stderr.on('data', (d) => { err += d; });
     child.on('error', (e) => {
       clearTimeout(timer);
@@ -82,7 +115,10 @@ export function run(argv, { cwd, timeoutMs = 900000, env = {}, signal } = {}) {
       if (signal) signal.removeEventListener('abort', onAbort);
       resolve({ code, reply: out.trim(), stderr: err.trim(), timedOut, aborted });
     });
-  });
+    });
+  } finally {
+    apiGate.release();
+  }
 }
 
 // pi 可执行入口。Windows 下 npm 全局装的 pi 是 pi.cmd shim，
@@ -96,35 +132,70 @@ function piProgram() {
   return ['pi']; // 非标准路径安装的兜底（交回 PATH 解析，可能 ENOENT 但至少有明确报错）
 }
 
-// pi --mode json 的 NDJSON 输出解析：取 turn_end.message 的文本（最终回复）与 usage。
-// 多回合工具调用时 turn_end 只有一个（pi -p 是单回合），但 message_end 可能多个——
-// usage 累计取各 assistant 消息之和，回复取最后一个 turn_end。
-export function parsePiJson(stdout) {
+// pi --mode json 的 NDJSON 流式解析器：边喂行边把 usage 增量实时回调（onUsage），
+// 结束后 finalize() 返回 { reply, usage }（回合累计）。
+// 实测事件语义（pi-json-probe 验证）：
+//   message_update.usage  流式期间当前 assistant 消息的"累计"值（首帧从 0 起）
+//   message_end.message.usage  该消息最终累计值（与最后一个 update 对齐）
+//   turn_end.message          与 message_end 同一条消息——usage 只认 message_end，
+//                             再计 turn_end 就是双计（旧版 bug，会让 token 翻倍）。
+// 多消息（工具调用多轮）时每条消息各自从 0 累计，apiCalls 按 message_end 计数。
+export function createPiJsonStreamParser(onUsage) {
   let reply = '';
+  let steps = 0; // assistant 消息数 ≈ 推理步数（pi 无 step 事件，每轮工具调用一条 assistant 消息）
+  let lastCum = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 }; // 当前消息的累计基线
   const usage = { apiCalls: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  for (const line of String(stdout).split('\n')) {
-    const t = line.trim();
-    if (!t.startsWith('{')) continue;
-    let j;
-    try { j = JSON.parse(t); } catch { continue; }
-    if (j.type === 'turn_end' || j.type === 'message_end') {
-      const msg = j.message;
-      if (!msg || msg.role !== 'assistant') continue;
+  const add = (u, isEnd) => {
+    if (!u) return;
+    // 累计快照 → 增量：同消息内 usage 单调不减；负差（异常重置）钳 0 不报，避免多计。
+    const d = {
+      apiCalls: isEnd ? 1 : 0,
+      inputTokens: Math.max(0, (Number(u.input) || 0) - lastCum.input),
+      outputTokens: Math.max(0, (Number(u.output) || 0) - lastCum.output),
+      cacheCreationTokens: Math.max(0, (Number(u.cacheWrite) || 0) - lastCum.cacheWrite),
+      cacheReadTokens: Math.max(0, (Number(u.cacheRead) || 0) - lastCum.cacheRead),
+    };
+    lastCum = { input: Number(u.input) || 0, output: Number(u.output) || 0, cacheWrite: Number(u.cacheWrite) || 0, cacheRead: Number(u.cacheRead) || 0 };
+    usage.apiCalls += d.apiCalls;
+    usage.inputTokens += d.inputTokens;
+    usage.outputTokens += d.outputTokens;
+    usage.cacheCreationTokens += d.cacheCreationTokens;
+    usage.cacheReadTokens += d.cacheReadTokens;
+    if (onUsage && (d.apiCalls || d.inputTokens || d.outputTokens || d.cacheCreationTokens || d.cacheReadTokens)) onUsage(d);
+  };
+  return {
+    line(l) {
+      const t = String(l).trim();
+      if (!t.startsWith('{')) return;
+      let j;
+      try { j = JSON.parse(t); } catch { return; }
+      if (j.type === 'message_update') { add(j.usage, false); return; }
+      if (j.type === 'message_end') {
+        const msg = j.message;
+        if (!msg || msg.role !== 'assistant') return;
+        steps += 1;
+        add(msg.usage, true);
+        // 下一条消息的 usage 从 0 重新累计：基线清零，否则会漏计/负计
+        lastCum = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+        return;
+      }
       if (j.type === 'turn_end') {
+        const msg = j.message;
+        if (!msg || msg.role !== 'assistant') return;
         const texts = (msg.content || []).filter((b) => b.type === 'text').map((b) => b.text);
         if (texts.length) reply = texts.join('\n');
+        // usage 不再从 turn_end 取（双计修复，见上）
       }
-      const u = msg.usage;
-      if (u) {
-        usage.apiCalls += 1;
-        usage.inputTokens += Number(u.input) || 0;
-        usage.outputTokens += Number(u.output) || 0;
-        usage.cacheCreationTokens += Number(u.cacheWrite) || 0;
-        usage.cacheReadTokens += Number(u.cacheRead) || 0;
-      }
-    }
-  }
-  return { reply, usage: usage.apiCalls ? usage : null };
+    },
+    finalize() { return { reply, steps, usage: usage.apiCalls ? usage : null }; },
+  };
+}
+
+// 整包解析（兼容入口）：pi 子进程结束后一次性喂给流式解析器。
+export function parsePiJson(stdout) {
+  const p = createPiJsonStreamParser(null);
+  for (const line of String(stdout).split('\n')) p.line(line);
+  return p.finalize();
 }
 
 export const harnesses = {
@@ -135,7 +206,7 @@ export const harnesses = {
   // 工具只给 bash + http 两个，够 worker 跑 git/测试/调协议。
   direct: {
     build(model) { return { model: model || 'gpt-5.5' }; },
-    async runTurn({ prompt, cwd, model, timeoutMs, serverPort, peer, maxSteps = 60, apiBase, apiKey, signal }) {
+    async runTurn({ prompt, cwd, model, timeoutMs, serverPort, peer, maxSteps = 60, apiBase, apiKey, signal, onUsage }) {
       const cfg = loadDirectConfig({ base: apiBase, token: apiKey });
       if (!cfg.token) return { ok: false, reply: '', error: 'direct: missing ANTHROPIC_AUTH_TOKEN' };
       const openai = cfg.apiType === 'openai'; // 新中转站仅 OpenAI 格式（/v1/messages 404）
@@ -178,6 +249,11 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
         { name: 'finish', description: 'Call this ONLY when your turn is fully done (submitted, or nothing suitable to do). Ends your turn.',
           input_schema: { type: 'object', properties: { summary: { type: 'string', description: 'Short summary of what you did this turn (include the word IDLE if there was no suitable work)' } }, required: ['summary'] } },
       ];
+      // prompt caching（Anthropic 计费优化）：给最后一个 tool 加 cache_control，Anthropic 会把
+      // "到这个标记为止的前缀"（整个 tools 数组，~2KB）缓存 5 分钟。worker 每回合反复发同样的
+      // tools 定义，缓存命中后 input_tokens 按 10% 计费。中转站不支持时该字段被忽略（无副作用）。
+      // 注意 OpenAI 格式路径下不传 cache_control（OpenAI 没这个字段）。
+      const anthropicTools = tools.map((t, i) => i === tools.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t);
       const messages = [{ role: 'user', content: prompt }];
       const deadline = Date.now() + (timeoutMs || 900000);
       const dbg = process.env.SWARM_DEBUG ? (...a) => console.error(`[direct:${peer}]`, ...a) : () => {};
@@ -195,11 +271,21 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
       const usage = { apiCalls: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
       const addUsage = (u) => {
         if (!u) return;
-        usage.apiCalls += 1;
-        usage.inputTokens += Number(u.input_tokens ?? u.prompt_tokens) || 0;
-        usage.outputTokens += Number(u.output_tokens ?? u.completion_tokens) || 0;
-        usage.cacheCreationTokens += Number(u.cache_creation_input_tokens) || 0;
-        usage.cacheReadTokens += Number(u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens) || 0;
+        const d = {
+          apiCalls: 1,
+          inputTokens: Number(u.input_tokens ?? u.prompt_tokens) || 0,
+          outputTokens: Number(u.output_tokens ?? u.completion_tokens) || 0,
+          cacheCreationTokens: Number(u.cache_creation_input_tokens) || 0,
+          cacheReadTokens: Number(u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens) || 0,
+        };
+        usage.apiCalls += d.apiCalls;
+        usage.inputTokens += d.inputTokens;
+        usage.outputTokens += d.outputTokens;
+        usage.cacheCreationTokens += d.cacheCreationTokens;
+        usage.cacheReadTokens += d.cacheReadTokens;
+        // 实时记账：每个 API 响应的 usage 即时回调 runner（流式速度显示的数据源），
+        // 回合结束时 runner 会用权威值减去 live 已入账量补差，不会双计。
+        try { if (onUsage) onUsage(d); } catch { /* 记账回调抛错不影响回合 */ }
       };
       try {
         for (; step < maxSteps; step++) {
@@ -228,7 +314,7 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
                     tool_choice: 'required',
                     messages: openaiMessages(messages),
                   }
-                : { model: bareModel, max_tokens: 4096, tools, tool_choice: { type: 'any' }, messages }),
+                : { model: bareModel, max_tokens: 4096, tools: anthropicTools, tool_choice: { type: 'any' }, messages }),
               signal,
             });
             j = await res.json().catch(() => ({}));
@@ -239,10 +325,13 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
           dbg(`step ${step}: api ${Date.now() - t0}ms status=${res.status} promptChars=${prompt.length}`);
           if (!res.ok) {
             const msg = j?.error?.message || JSON.stringify(j).slice(0, 300);
+            const rl = isRateLimit(res.status, msg);
+            // 全局自适应并发：撞限流即乘性回退在飞上限，别让后续请求继续压死服务端。
+            if (rl) apiGate.noteRateLimit();
             // 限流：回合内退避重试，且不消耗 step 预算（step-- 抵消 for 的 step++）。
             // 退避 = min(30s, 1.5s * 2^retry) + 0~1.5s 抖动；服务端给了 Retry-After 就听它的。
             // 抖动是关键：N 个 worker 若同时撞限流、又同时重试，会持续把已过载的服务端压死。
-            if (isRateLimit(res.status, msg) && rateRetries < MAX_RATE_RETRY) {
+            if (rl && rateRetries < MAX_RATE_RETRY) {
               const ra = Number(res.headers.get('retry-after'));
               const base = Number.isFinite(ra) && ra > 0 ? ra * 1000 : 1500 * Math.pow(2, rateRetries);
               const waitMs = Math.min(30000, base) + Math.floor(Math.random() * 1500);
@@ -254,8 +343,9 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
               continue;
             }
             // 限流重试耗尽：交回 runner 做更长退避（rateLimited 标记），不当作普通错误烧 turn。
-            return { ok: false, reply: lastText, error: `api ${res.status}: ${msg}`, usage, rateLimited: isRateLimit(res.status, msg) };
+            return { ok: false, reply: lastText, error: `api ${res.status}: ${msg}`, usage, rateLimited: rl };
           }
+          apiGate.noteOk(); // 请求成功：加性回升在飞上限（AIMD），缓慢逼近天花板
           // 响应解析：OpenAI 是 choices[0].message{content, tool_calls}，
           // Anthropic 是 content blocks。统一归一化成 {text, toolUses:[{name, input, id}]}，
           // 后续 finish 检测/工具执行走同一套逻辑。
@@ -346,22 +436,26 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
   // token 来源与 direct harness 相同：--api-key/环境变量 > ~/.claude/settings.json。
   pi: {
     build(model) { return { model: model || '' }; },
-    async runTurn({ prompt, cwd, model, timeoutMs, signal, env = {}, apiBase, apiKey }) {
+    async runTurn({ prompt, cwd, model, timeoutMs, signal, env = {}, apiBase, apiKey, onUsage }) {
       const cfg = loadDirectConfig({ base: apiBase, token: apiKey });
       const tools = process.platform === 'win32'
         ? 'read,bash,edit,write,powershell' : 'read,bash,edit,write';
-      // --mode json：NDJSON 事件流，turn_end 带完整 usage（input/output/cacheRead），
+      // --mode json：NDJSON 事件流，message_update/message_end 带 usage（input/output/cacheRead），
       // runner 的 token 记账才有数据。纯文本模式 stdout 只剩最终回复，usage 全丢。
       const argv = [...piProgram(), '-p', '--no-session', '--no-extensions', '--no-context-files',
         '--offline', '--tools', tools, '--mode', 'json'];
       if (model) argv.push('--model', model);
       argv.push('--', prompt);
-      const r = await run(argv, { cwd, timeoutMs, signal, env: { ...env, SWARM_PI_API_KEY: cfg.token || '' } });
-      const parsed = parsePiJson(r.reply || '');
+      // 流式实时记账：逐行喂解析器，usage 增量即时回调 runner（DeepSeek 客户端式 tok/s 的数据源），
+      // 回合结束后 finalize 拿权威累计——两路都出自同一解析器，天然不双计。
+      const parser = createPiJsonStreamParser(onUsage || null);
+      const r = await run(argv, { cwd, timeoutMs, signal, env: { ...env, SWARM_PI_API_KEY: cfg.token || '' }, onLine: (l) => parser.line(l) });
+      const parsed = parser.finalize();
       return {
         ok: r.code === 0 && !r.timedOut && !r.aborted && !!parsed.reply,
         reply: parsed.reply || r.reply || r.stderr || '(empty)',
         error: r.error || (r.timedOut ? 'timeout' : null),
+        steps: parsed.steps,
         usage: parsed.usage,
       };
     },
@@ -440,9 +534,9 @@ Every POST needs its parameters (itemId, peer, token, commitSha, ...) INSIDE the
         if (line.startsWith('commit')) {
           const msg = line.slice(6).trim() || `wip: ${vars.peer}`;
           try {
-            execFileSync('git', ['add', '-A'], { cwd, encoding: 'utf8' });
+            execFileSync('git', ['add', '-A'], { cwd, encoding: 'utf8', windowsHide: true });
             execFileSync('git', ['-c', 'user.name=swarm', '-c', 'user.email=swarm@local', 'commit', '-m', msg],
-              { cwd, encoding: 'utf8' });
+              { cwd, encoding: 'utf8', windowsHide: true });
           } catch { /* 无改动或已提交，忽略 */ }
           continue;
         }
@@ -614,7 +708,9 @@ Rules:
 - Each item = ONE concrete deliverable, sized for a single agent turn (or a small group of sub-items it can split itself).
 - Give each item a title that names ONLY its concrete deliverable (prefer a real file path with extension, e.g. "src/auth.js"). No verbs like "Create"/"创建", no parenthetical notes.
 - Order items so foundational work (scaffolding, config, shared interfaces) comes before dependent work.
+- AGGREGATOR/BARREL files LAST: any file whose only job is to re-export or aggregate other modules (index.js barrels, README.md, package entry points) MUST be the FINAL item — never first. If it is created before its dependencies exist, the swarm will waste turns re-editing it as each dependency lands (observed: barrel written early exports only 12 of 15 modules → 6 re-export test failures).
 - Do NOT over-decompose: 3~${n} items is plenty. Workers will split further as needed.
+- Keep items balanced in size: if the mission lists many concrete things (files/functions), split them evenly across items rather than creating one giant item.
 - Respond with ONLY a JSON object, no prose, no markdown fence:
 {"items":[{"title":"...","detail":"what done looks like + how to verify","kind":"task","priority":5}]}`;
 
@@ -647,6 +743,15 @@ Rules:
     const items = parsePlannerItems(text);
     if (items.length === 0) { lastErr = new Error(`planner returned no parseable items; raw: ${text.slice(0, 300)}`); continue; }
     return { items, usage: j.usage || null, raw: text };
+  }
+  // 兜底：LLM 4 次都返回不可解析内容时，从 mission 文本里硬提取文件路径拆解。
+  // 保证即使 planner 完全失灵也能启动（拆得粗糙但能用，worker 会自行细拆）。
+  console.warn('[swarm] planner parse failed, falling back to regex extraction');
+  const fallback = mission.match(/(?:src|test|lib|app|docs?|config)\/[\w./-]+\.\w+/g) || [];
+  const unique = [...new Set(fallback)];
+  if (unique.length > 0) {
+    const items = unique.slice(0, n).map((title) => ({ title, detail: `Implement ${title} as described in the mission.`, kind: 'task', priority: 5 }));
+    return { items, usage: null, raw: '(regex fallback)' };
   }
   throw lastErr || new Error('planMission failed');
 }

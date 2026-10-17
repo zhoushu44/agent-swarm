@@ -6,7 +6,7 @@
 import http from 'node:http';
 import { dashboardHtml } from './dashboard.js';
 
-export function createServer(store, { port = 17771, token = null, getStatus = null, dedupJudge = null } = {}) {
+export function createServer(store, { port = 17771, token = null, getStatus = null, dedupJudge = null, getCommitSha = null } = {}) {
   const json = (res, code, obj) => {
     const body = JSON.stringify(obj);
     res.writeHead(code, {
@@ -157,7 +157,13 @@ export function createServer(store, { port = 17771, token = null, getStatus = nu
         }
         if (p === '/submit') {
           // worker 交作业：校验租约 → item 转 submitted 并入队，等集成器跑门禁
-          const r = store.submitWork(body.token, body.peer, body.commitSha || null);
+          // commitSha 服务端回填：worker 忘传/传不出（echo harness 等）时取分支当前 tip。
+          // 有这个 sha，集成器才能做归因校验（提交后分支被吸收 → 拒记 done）。
+          let commitSha = body.commitSha || null;
+          if (!commitSha && getCommitSha && body.peer) {
+            try { commitSha = (await getCommitSha(body.peer)) || null; } catch { commitSha = null; }
+          }
+          const r = store.submitWork(body.token, body.peer, commitSha);
           return r ? json(res, 200, { ok: true, ...r }) : json(res, 409, { error: 'lease expired or item not pending' });
         }
       }
