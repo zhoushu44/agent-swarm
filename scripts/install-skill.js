@@ -224,6 +224,21 @@ node "${normalized}/cli.js" run "C:/Users/zs/projects/my-todo" --harness direct 
 # 5. 提示用户打开 http://127.0.0.1:17771/dashboard 看实时监控
 \`\`\`
 
+## 运行时安全（必须遵守，违反会拖垮用户机器）
+
+- **绝对不要给 swarm 加外部看门狗**（计划任务 / \`schtasks\` / 循环脚本重启）。
+  swarm 自己管 worker 生命周期；进程被杀就是该停。外部保活会让崩溃循环反复重建 worker 池
+  ——真实事故：某次用计划任务每 2 分钟重启 12-worker 池，把整台机器 CPU/内存耗干卡死。
+- **必须带 \`--exit-when-done\`**，并把 \`run\` 当成需要监控的长任务；不要让它无人值守无限跑。
+- **凭据不进命令行**：\`--api-key sk-xxx\` 会出现在进程列表、shell 历史和日志里。
+  请用 \`~/.swarm/api.json\` 或 \`SWARM_API_BASE\` / \`SWARM_API_KEY\` 环境变量。
+- **不要盲目调高并发**：\`--max-workers\` 缺省已按机器核数自适应（\`max(2, 核数/2)\`）；
+  系统资源护栏默认开启（CPU>80% 停扩、>92% 缩容），不要用 \`--no-resource-guard\` 绕过。
+- 用户抱怨"电脑卡死/进程反复复活"时的处置顺序：
+  1. \`tasklist | findstr node\` 找到命令行含 \`swarm/cli.js run\` 的进程，连同它的 \`cmd.exe\` 父进程一起结束；
+  2. 查 \`schtasks /query\` 与启动项，删除任何保活 swarm 的计划任务；
+  3. 确认 \`.swarm/watchdog.ps1\` 之类的脚本不会被再次拉起。
+
 ## 注意事项
 
 - **跑完后自动退出**（\`--exit-when-done\`），输出 \`[swarm] DONE {json}\`

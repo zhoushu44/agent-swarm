@@ -250,6 +250,12 @@ A: `node cli.js status ../my-project` 看 `crashStats` 字段，按错误类型�
 **Q: 集成冲突太多怎么办？**  
 A: swarm 会自动处理三类冲突（scratch 文件拦截 / 文本清单合并 / LLM 三路仲裁），如果还是频繁失败，检查 mission 拆解粒度是否太细。
 
+**Q: 电脑被跑卡死了 / node 进程杀了又活怎么办？**  
+A: 两个可能。① 并发开太高：删掉 `--no-resource-guard`，让资源护栏生效（默认就是开的），
+并把 `--max-workers` 降到机器核数一半以内。② 有外部看门狗在保活：查 `schtasks /query`、
+启动项和项目里的 `.swarm/watchdog.ps1`——swarm 自己不需要任何保活装置，杀进程时连它的
+`cmd.exe` 父进程一起结束即可（详见「运行时安全」）。
+
 **Q: 成本多少？**  
 A: 实测 100 workers 跑一个中等 mission（39 任务、296 测试）约 600M tokens，按中转站定价约 ¥500-2000。
 
@@ -305,7 +311,7 @@ node cli.js status ../my-project
 | `--min-workers N` | `1` | worker 池下限（autoscaler 的地板） |
 | `--max-turns N` | `10` | 每个 worker 最多跑几个回合 |
 | `--test-cmd "..."` | — | 集成门禁测试命令；通过才保留合并，失败自动回滚 |
-| `--max-inflight N` | `64` | 全局在飞 API 请求上限（见下） |
+| `--max-inflight N` | 自适应 | 全局在飞 API 请求上限（默认 `clamp(workers×4, 8, 64)`，见下） |
 | `--max-items N` | `200` | 任务发散护栏：总 item 数达到上限后停止 auto-split |
 | `--plan` | off | board 为空时先自动规划首批工作项再开跑 |
 | `--port N` | `17771` | 协调 API 与 dashboard 端口 |
@@ -356,7 +362,12 @@ autoscaler 是独立异步循环，只看 board 计数（不看内容）：
 
 所有 worker 共享同一个 Node 进程，也就共享同一个上游配额。没有闸门时 1000 个 worker 会同时打请求，
 把中转站压死（大面积 503 "system cpu overloaded"），反而拖长总墙钟时间。
-进程级信号量把"在飞 API 请求数"钳在上限内（默认 64，`--max-inflight` / `SWARM_MAX_INFLIGHT` 覆盖，`0` = 不限流）。
+进程级信号量把"在飞 API 请求数"钳在上限内（默认 `clamp(workers×4, 8, 64)`，
+`--max-inflight` / `SWARM_MAX_INFLIGHT` 覆盖，`0` = 不限流）。
+
+> 2026-10 修正：旧默认是 `max(64, workers)`——在只有 2~6 个 worker 的小机器上闸门等于形同虚设，
+> 一次 run 能同时挂几十条连接，把本机网络栈和中转站一起拖慢。现在跟随 worker 数自适应，
+> 下限 8 防止并发过低拖长墙钟，上限 64 防止撞 429 反而更慢。
 
 ### 崩溃恢复
 
@@ -388,6 +399,36 @@ worker 手头无租约、board 也无 claimable 项时退避轮询，不烧 LLM 
 - **无测试文件跳过**：`node --test test/*.test.js` 这类门禁在 test 目录为空时直接放行（输出 `(skipped: no test files yet)`），等真实测试落地后再门禁——避免 src 模块先于 test 提交时的时序性空跑。
 - **文本清单合并**：`LICENSE` / `.gitignore` / `.npmrc` 等白名单文件的 add/add 冲突做行级去重并集合并（不再回滚让 worker 重试）。
 - **LLM 三路仲裁**：白名单外的源码冲突（两个 worker 同时改 `utils.js`）先跑 `git merge-file` 三路合并；有冲突块时把 base/ours/theirs 发给 LLM 裁决，输出必须通过 `node --check` 语法校验。单次最多仲裁 3 个文件（防无限烧 token）。
+
+### 系统资源护栏（2026-10 新增）
+
+事故背景：一次 `--max-workers 12 --max-inflight 64` 的 run 跑在普通 PC 上（外加外部看门狗保活），
+把机器 CPU/内存耗干直接卡死。根因不是 Node 性能，而是项目此前**零资源感知**——机器多大都敢开 N 个 worker。
+
+护栏分两层：
+
+1. **默认值自适应**：不传 `--max-workers` 时，上限取 `max(2, ceil(CPU核数 / 2))`，不再无脑默认 8。
+2. **运行时动态钳制**（`src/sysload.js`）：autoscaler 每轮扩容前采一次系统快照，
+   按压力档位钳制 `want`：
+
+| 档位 | 触发条件 | 行为 |
+|---|---|---|
+| `ok` | CPU < 80% 且可用内存 > 15% | 不设上限，用户 `--max-workers` 说了算 |
+| `high` | CPU > 80% 或可用内存 < 15% | `ceiling = active`，只许停不许扩 |
+| `critical` | CPU > 92% 或可用内存 < 8% | `ceiling = active - 1`，主动缩一个 |
+
+要点：
+
+- **跨平台**：Windows 上 `os.loadavg()` 恒为 `[0,0,0]`，禁用；CPU 占用率用 `os.cpus()` 的
+  `times` 两次采样差分计算（首样本返回 `null`，不误判）。
+- **只拦增长，不替用户做决定**：机器健康时不会因为核数少就压掉你显式设置的 `--max-workers`。
+- **可观测**：`GET /status` 增加 `resourceGuard: { enabled, pressure, ceiling, sample }`；
+  压力档位变化时发 `autoscaler.guard_pressure` 事件（只在变化时发，不刷屏）。
+- **逃生开关**：`--no-resource-guard` 完全关闭；启动行会打印 `resource-guard=on|OFF`。
+- 测试：`npm run test:guard`（纯函数 + 采样器，离线零依赖）。
+
+> 注意：护栏防的是"本机被自己跑死"，不防"外部看门狗每 2 分钟重启你"。后者请用
+> `--exit-when-done` + 计划任务自身的运行时限，别用无上限的保活脚本。
 
 ### 任务发散护栏
 

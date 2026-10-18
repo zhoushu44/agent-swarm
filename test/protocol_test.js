@@ -45,7 +45,7 @@ async function scenarioGateFail() {
   store.addItem({ id: 't1', title: 'bad change', createdBy: 'test' });
   const PORT = 17898;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'gate fail test',
     // 门禁：固定失败（避免引号嵌套导致 cmd 挂起）
@@ -84,7 +84,7 @@ async function scenarioGatePass() {
   store.addItem({ id: 't1', title: 'good change', createdBy: 'test' });
   const PORT = 17897;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'gate pass test', testCmd: null,
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -118,7 +118,7 @@ async function scenarioAutoscale() {
   for (let i = 1; i <= 4; i++) store.addItem({ id: `t${i}`, title: `task ${i}`, createdBy: 'test' });
   const PORT = 17896;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'autoscale test', testCmd: null,
     maxTurns: 99, idleTurnsToExit: 99, minWorkers: 1, maxWorkers: 4,
@@ -167,7 +167,7 @@ async function scenarioLeaseRenew() {
   store.addItem({ id: 't1', title: 'long task', createdBy: 'test' });
   const PORT = 17894;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'lease renew test', testCmd: null,
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -207,7 +207,7 @@ async function scenarioBaselineSync() {
   store.addItem({ id: 't2', title: 'dependent change', createdBy: 'test' });
   const PORT = 17893;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'baseline sync test', testCmd: null,
     maxTurns: 2, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -251,7 +251,7 @@ async function scenarioIntegrationIsolation() {
   store.addItem({ id: 't1', title: 'isolated change', createdBy: 'test' });
   const PORT = 17892;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'integration isolation test', testCmd: null,
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -293,7 +293,7 @@ async function scenarioDeepAutoscale() {
   store.addItem({ id: 'big', title: 'one huge task', createdBy: 'test' });
   const PORT = 17891;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'deep autoscale test', testCmd: null,
     maxTurns: 99, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 8,
@@ -331,7 +331,7 @@ async function scenarioMinWorkersFloor() {
   store.addItem({ id: 'only', title: 'single item', createdBy: 'test' });
   const PORT = 17890;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'minWorkers floor test', testCmd: null,
     maxTurns: 99, idleTurnsToExit: 99, minWorkers: 4, maxWorkers: 10,
@@ -506,7 +506,7 @@ async function scenarioReaper() {
   store.addItem({ id: 't1', title: 'work', createdBy: 'test' });
   const PORT = 17889;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'reaper test', testCmd: null,
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -554,7 +554,7 @@ async function scenarioReaperGuard() {
   store.addItem({ id: 't1', title: 'pending integration', createdBy: 'test' });
   const PORT = 17888;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'reaper guard test', testCmd: null,
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -602,7 +602,7 @@ async function scenarioStructureGate() {
   store.addItem({ id: 't1', title: 'broken js', createdBy: 'test' });
   const PORT = 17879;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'structure gate test',
     testCmd: 'node -e process.exit(0)', // 门禁本身会过 → 只有结构检查能拦下这个提交
@@ -683,7 +683,7 @@ async function scenarioSyncSkew() {
   store.addItem({ id: 't2', title: 'collide b', createdBy: 'test' });
   const PORT = 17878;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'sync skew test', testCmd: null,
     maxTurns: 40, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 2,
@@ -746,7 +746,7 @@ async function scenarioRedoExhausted() {
   store.addItem({ id: 't2', title: 'collide b', createdBy: 'test' });
   const PORT = 17876;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'redo budget test', testCmd: null,
     maxTurns: 40, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 2,
@@ -789,7 +789,7 @@ async function scenarioBatchIntegrate() {
   store.addItem({ id: 't2', title: 'batch b', createdBy: 'test' });
   const PORT = 17875;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'batch integrate test', testCmd: null,
     maxTurns: 8, idleTurnsToExit: 99, minWorkers: 2, maxWorkers: 2,
@@ -845,7 +845,7 @@ async function scenarioItemFuse() {
   store.addItem({ id: 't1', title: 'poison item', createdBy: 'test' });
   const PORT = 17874;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'item fuse test', testCmd: 'node -e process.exit(1)',
     maxTurns: 12, idleTurnsToExit: 99, minWorkers: 1, maxWorkers: 1,
@@ -892,7 +892,7 @@ async function scenarioBudgetFuse() {
   store.addItem({ id: 't2', title: 'never touched', createdBy: 'test' });
   const PORT = 17873;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'budget fuse test', testCmd: null, budgetTokens: 1000,
     maxTurns: 20, idleTurnsToExit: 99, minWorkers: 1, maxWorkers: 1,
@@ -979,7 +979,7 @@ async function scenarioPatchSummary() {
   store.addItem({ id: 't1', title: 'good patch', createdBy: 'test' });
   const PORT = 17877;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'patch summary test', testCmd: null, // 无门禁 → ungated
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,
@@ -1027,7 +1027,7 @@ async function scenarioStaleSubmitRejected() {
   store.addItem({ id: 't1', title: 'real change that will be absorbed', createdBy: 'test' });
   const PORT = 17872;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'stale submit test', testCmd: null,
     maxTurns: 2, idleTurnsToExit: 99, minWorkers: 0, maxWorkers: 1,
@@ -1071,7 +1071,7 @@ async function scenarioIntegrationCleanSlate() {
   store.addItem({ id: 't1', title: 'clean merge', createdBy: 'test' });
   const PORT = 17871;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
     mission: 'clean slate test', testCmd: null,
     maxTurns: 1, idleTurnsToExit: 1, minWorkers: 1, maxWorkers: 1,

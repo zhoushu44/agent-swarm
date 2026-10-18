@@ -47,7 +47,7 @@ export async function run() {
 
   const PORT = 17799;
   const { server } = await createServer(store, { port: PORT });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT,
     harness: 'direct', model: MODEL, apiBase: API_BASE, apiKey: API_KEY,
     mission: '在仓库里创建 src/math.js 导出 add(a,b)，并写一个能跑通的测试。',

@@ -11,15 +11,22 @@ import crypto from 'node:crypto';
 import { Repo, gitAsync, gitOkAsync, isAncestor } from './gitutil.js';
 import { getHarness, apiInflight } from './harness.js';
 import { buildWorkerPrompt } from './prompts.js';
+import { sampleSystem, guardCeiling } from './sysload.js';
 
 export class Runner {
-  constructor({ store, repoRoot, serverPort, apiToken, harness = 'claude', model, mission, conventions, testCmd, maxTurns = 10, turnTimeoutMs = 900000, idleTurnsToExit = 2, maxWorkers = 8, minWorkers = 1, leaseSec = 300, worktreeCache = new Map(), apiBase = null, apiKey = null, briefEnabled = true, budgetTokens = null, maxItems = 200 }) {
+  constructor({ store, repoRoot, serverPort, apiToken, harness = 'claude', model, mission, conventions, testCmd, maxTurns = 10, turnTimeoutMs = 900000, idleTurnsToExit = 2, maxWorkers = 8, minWorkers = 1, leaseSec = 300, worktreeCache = new Map(), apiBase = null, apiKey = null, briefEnabled = true, budgetTokens = null, maxItems = 200, resourceGuard = true, sysProbe = null }) {
     this.store = store; this.repoRoot = repoRoot; this.serverPort = serverPort; this.apiToken = apiToken;
     this.harnessName = harness; this.harness = getHarness(harness); this.model = model;
     this.apiBase = apiBase; this.apiKey = apiKey;
     this.mission = mission; this.conventions = conventions; this.testCmd = testCmd;
     this.maxTurns = maxTurns; this.turnTimeoutMs = turnTimeoutMs; this.idleTurnsToExit = idleTurnsToExit;
     this.maxWorkers = maxWorkers; this.minWorkers = minWorkers;
+    // 系统资源护栏：autoscaler 扩容前先看机器脸色（CPU 差分占用率 + 可用内存比）。
+    // 事故背景：--max-workers 12 跑在普通 PC 上把机器卡死——项目此前零资源感知。
+    // sysProbe 是测试注入口（替代真实采样）；resourceGuard=false 即 --no-resource-guard。
+    this.resourceGuard = resourceGuard !== false;
+    this.sysProbe = sysProbe || null;
+    this._guardState = { pressure: 'ok', ceiling: null, sample: null };
     this.leaseSec = leaseSec;
     // P7 预算熔断：整个 run 的 token 总预算（null = 不设限）。口径 = input+output+
     // cacheCreation+cacheRead 全记——KV-cache 便宜但不是免费，防的是"预算形同虚设"。
@@ -767,8 +774,22 @@ export class Runner {
       // 任务比例护栏：并行度跟随真实可认领任务数，别让多余 worker 空转抢同一批任务
       // （空转 + 重复子项 + 限流）。上限 = max(8, open*2)，下限仍由 minWorkers 保证。
       const capped = Math.min(demand, Math.max(8, open * 2));
-      const want = Math.min(this.maxWorkers, Math.max(this.minWorkers, capped));
-      if (want > active) {
+      let want = Math.min(this.maxWorkers, Math.max(this.minWorkers, capped));
+      // 系统资源护栏：机器喘不过气时把 want 钳到护栏上限（high=只许停不许扩，
+      // critical=主动缩一个）。与任务比例护栏串联——两层取最小，谁紧听谁的。
+      // 事件只在压力档位变化时记（每秒一轮的循环不能刷屏）。
+      if (this.resourceGuard) {
+        const sample = this.sysProbe ? this.sysProbe() : sampleSystem();
+        const g = guardCeiling(sample, { active });
+        const prev = this._guardState.pressure;
+        this._guardState = { pressure: g.pressure, ceiling: g.ceiling, sample };
+        if (g.pressure !== prev) {
+          this.log('autoscaler.guard_pressure', { pressure: g.pressure, ceiling: g.ceiling, cpuBusy: sample.cpuBusy, freeMemRatio: +sample.freeMemRatio.toFixed(3), active, want });
+          if (g.pressure !== 'ok') this._emit('autoscaler.guard_pressure', { pressure: g.pressure, ceiling: g.ceiling, active });
+        }
+        // ceiling=null 表示机器健康、不设上限（用户 maxWorkers 说了算）。
+        if (g.ceiling != null) want = Math.min(want, g.ceiling);
+      }      if (want > active) {
         const need = Math.min(want - active, maxSpawnPerRound); // 限速
         // 并发 spawn：spawnWorker 内部首行同步生成名字，故循环调用不会撞名；
         // addWorktree 是异步子进程，串行 await 会让扩容时间随数量线性增长。
@@ -877,6 +898,13 @@ export class Runner {
       startedAt: this._startedAt || null,
       briefEnabled: this.briefEnabled,
       budget: { tokens: this.budgetTokens, spent: this._tokensSpent(), exceeded: !!this.budgetExceeded },
+      // 资源护栏实时状态：监控面板据此显示"当前被机器资源压着"而非误判 swarm 卡住。
+      resourceGuard: {
+        enabled: this.resourceGuard,
+        pressure: this._guardState.pressure,
+        ceiling: this._guardState.ceiling,
+        sample: this._guardState.sample,
+      },
       tokenUsage: this.tokenUsage,
       itemTokens: Object.fromEntries(this.itemTokens),
       apiInflight: apiInflight(),

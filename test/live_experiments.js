@@ -66,7 +66,7 @@ function writeGate(tag, body) {
 async function launch({ port, workerCount, maxTurns, briefEnabled, repoDir, mission, testCmd, turnTimeoutMs = 240000, idleTurnsToExit = 2, leaseSec = 300 }) {
   const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
   const { server } = await createServer(store, { port });
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: port, harness: 'direct', model: MODEL,
     apiBase: API_BASE, apiKey: API_KEY, mission, testCmd,
     maxTurns, minWorkers: workerCount, maxWorkers: workerCount,
@@ -226,7 +226,7 @@ async function exp2a() {
   const repoDir = tmpRepo('exp2a');
   const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
   seedCommon(store, 5);
-  const runner = new Runner({ store, repoRoot: repoDir, serverPort: 0, harness: 'echo', mission: 'x', testCmd: null });
+  const runner = new Runner({ resourceGuard: false, store, repoRoot: repoDir, serverPort: 0, harness: 'echo', mission: 'x', testCmd: null });
   const w = { name: 'w1', lastReply: 'claimed m1, wrote src/m1.js, submitted.' };
   const rows = [];
   for (let turn = 1; turn <= 3; turn++) {

@@ -60,7 +60,7 @@ export async function run() {
   const { server } = await createServer(store, { port: PORT });
 
   // ---------- 3. Runner（echo harness） ----------
-  const runner = new Runner({
+  const runner = new Runner({ resourceGuard: false,
     store, repoRoot: repoDir, serverPort: PORT, apiToken: null,
     harness: 'echo', mission: 'offline test', conventions: null, testCmd: null,
     maxTurns: 4, idleTurnsToExit: 1, maxWorkers: 4, minWorkers: 2,

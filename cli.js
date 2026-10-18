@@ -9,13 +9,15 @@
 // 状态存到 <repoDir>/.swarm/state.db
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import process from 'node:process';
 import { Store } from './src/store.js';
 import { createServer } from './src/server.js';
 import { Runner } from './src/runner.js';
 import { Repo, gitOkAsync } from './src/gitutil.js';
-import { setMaxInflight, planMission, createDedupJudge } from './src/harness.js';
+import { setMaxInflight, apiInflight, planMission, createDedupJudge } from './src/harness.js';
 import { validateRules } from './src/prompts.js';
+import { machineCeiling } from './src/sysload.js';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -94,8 +96,13 @@ async function main() {
     const model = flag('model') || fromKv('model') || undefined;
     // --workers 只作为上限别名（max），下限默认 1：autoscaler 按真实任务量伸缩。
     // 若把 --workers 也当下限，会出现"20 个任务强拉 200 worker"的空转（idle_skip 爆炸）。
-    const maxWorkers = Number(flag('max-workers') || flag('workers') || fromKv('maxWorkers') || 8);
+    // 缺省值按机器自适应（CPU 核数的一半，下限 2）：不再无脑默认 8——4 核小机器
+    // 默认 8 必然卡死（真实事故）。显式传 --max-workers 时尊重用户值，但运行时
+    // 资源护栏（resourceGuard）仍会在系统超载时动态钳制，--no-resource-guard 关闭。
+    const machineDefault = machineCeiling(os.cpus().length);
+    const maxWorkers = Number(flag('max-workers') || flag('workers') || fromKv('maxWorkers') || machineDefault);
     const minWorkers = Number(flag('min-workers') || fromKv('minWorkers') || 1);
+    const resourceGuard = !flag('no-resource-guard');
     // 自动退出模式：board 清空、集成队列空、worker 全退场时优雅退出并打印
     // `[swarm] DONE {json}` 总结行（供 /swarm 扩展解析）。此时 autoscaler 下限
     // 必须降为 0——否则它会按 minWorkers 永远重拉 worker，active 永不为 0。
@@ -109,11 +116,15 @@ async function main() {
     const apiKey = flag('api-key') || process.env.SWARM_API_KEY || null;
     // 全局在飞 API 闸门：限制同时打到中转站的请求数（0 = 不限流）。
     // 1000 agent 同时冲会把中转站压死（大面积 503），反而拖长总墙钟时间。
+    // 未显式指定时按 worker 数自适应（每 worker 4 条基准，夹在 [8, 64]）：
+    // 旧的固定 max(64, workers) 在只有 2~6 个 worker 的小机器上等于"闸门形同虚设"，
+    // 一次 run 能同时挂几十条连接，把本机网络栈和中转站一起拖慢（真实事故）。
+    // 优先级：--max-inflight > SWARM_MAX_INFLIGHT（模块初始化已读）> 自适应。
     const maxInflight = flag('max-inflight');
-    // 未显式指定时把在飞上限抬到 max(64, worker 数)：让 apiGate 别在 worker 数之下自锁；
-    // 真实上限由限流反馈的 AIMD 自动收敛（撞 429 就降 0.75x，稳定就缓慢回升）。
+    const autoInflight = Math.min(64, Math.max(8, maxWorkers * 4));
     if (maxInflight !== null && maxInflight !== true) setMaxInflight(maxInflight);
-    else setMaxInflight(Math.max(64, maxWorkers));
+    else if (process.env.SWARM_MAX_INFLIGHT) { /* 环境变量已生效，尊重它 */ }
+    else setMaxInflight(autoInflight);
     const apiToken = null; // 本地运行先不开 token
     // P7 预算熔断 + P6 熔断阈值：均可经 flag 或环境变量配置。
     // budgetTokens=0 表示"立即熔断"（测试用），null 表示不设限。
@@ -191,7 +202,7 @@ async function main() {
       store, repoRoot: repoDir, serverPort: port, apiToken,
       harness, model, mission, conventions, testCmd,
       maxTurns, maxWorkers, minWorkers: exitWhenDone ? 0 : minWorkers, leaseSec, apiBase, apiKey,
-      budgetTokens,
+      budgetTokens, resourceGuard,
       // 任务发散护栏：auto-split 的总 item 数上限。默认 200，--max-items 覆盖。
       maxItems: Number(flag('max-items') || 200),
     });
@@ -212,7 +223,7 @@ async function main() {
     // 初始拉起 minWorkers（自动退出模式下仍拉 max(1, minWorkers) 个起活）
     for (let i = 0; i < Math.max(1, minWorkers); i++) await runner.spawnWorker(`w${i + 1}`);
     const startMs = Date.now();
-    console.log(`swarm running: harness=${harness} workers=${minWorkers}..${maxWorkers} api=http://127.0.0.1:${port}${exitWhenDone ? ' exit-when-done' : ''}`);
+    console.log(`swarm running: harness=${harness} workers=${minWorkers}..${maxWorkers} inflight<=${apiInflight().limit} api=http://127.0.0.1:${port}${exitWhenDone ? ' exit-when-done' : ''}${resourceGuard ? ' resource-guard=on' : ' resource-guard=OFF'}`);
     console.log('press Ctrl+C to stop');
     // 实时运行窗口：5s 一刷，带 tokens/s 差分速度（真实调用才有速度，echo 离线为 0）。
     let lastTk = null; let lastTs = Date.now(); let elapsed = 0;
@@ -389,6 +400,7 @@ usage:
   swarm run <repoDir> --mission "..." [--test-cmd "..."] [--harness pi|direct|claude|codex|echo]
             [--model NAME] [--max-workers N] [--min-workers N] [--max-turns N]
             [--max-inflight N] [--plan] [--port 17771] [--conventions FILE] [--seed FILE]
+            [--no-resource-guard]  关闭系统资源护栏（默认开启：超载时自动钳制/缩减 worker 池）
   swarm board <repoDir>
   swarm status <repoDir>
 

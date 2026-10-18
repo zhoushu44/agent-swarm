@@ -1,12 +1,13 @@
 {
   "name": "swarm",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "Agensh-style decentralized multi-agent orchestrator on top of existing CLI harnesses",
   "bin": { "swarm": "./cli.js" },
   "scripts": {
     "test": "node test/run_tests.js",
+    "test:guard": "node test/resource_guard_test.js",
     "test:protocol": "node test/protocol_test.js",
     "test:offline": "node test/offline_swarm_test.js",
     "test:live": "node test/live_swarm_test.js"

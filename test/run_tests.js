@@ -3,8 +3,10 @@
 import { run as offlineRun } from './offline_swarm_test.js';
 import { run as protocolRun } from './protocol_test.js';
 import { run as apiRun } from './api_test.js';
+import { run as resourceGuardRun } from './resource_guard_test.js';
 
 const suites = [
+  ['resource_guard', resourceGuardRun],
   ['offline_swarm', offlineRun],
   ['protocol', protocolRun],
   ['api', apiRun],
