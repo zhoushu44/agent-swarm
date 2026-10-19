@@ -99,8 +99,11 @@ async function main() {
     // 缺省值按机器自适应（CPU 核数的一半，下限 2）：不再无脑默认 8——4 核小机器
     // 默认 8 必然卡死（真实事故）。显式传 --max-workers 时尊重用户值，但运行时
     // 资源护栏（resourceGuard）仍会在系统超载时动态钳制，--no-resource-guard 关闭。
+    // --max-workers 0 表示"无静态上限"：worker 数完全由任务量 + 运行时资源护栏
+    // （CPU>80% 停扩、CPU>92% 主动缩、可用内存<15% 停扩、<8% 主动缩）动态决定。
     const machineDefault = machineCeiling(os.cpus().length);
-    const maxWorkers = Number(flag('max-workers') || flag('workers') || fromKv('maxWorkers') || machineDefault);
+    const maxWorkersRaw = flag('max-workers') ?? flag('workers') ?? fromKv('maxWorkers') ?? machineDefault;
+    const maxWorkers = Number(maxWorkersRaw); // 0 = 不设上限（交给资源护栏）
     const minWorkers = Number(flag('min-workers') || fromKv('minWorkers') || 1);
     const resourceGuard = !flag('no-resource-guard');
     // 自动退出模式：board 清空、集成队列空、worker 全退场时优雅退出并打印
@@ -121,7 +124,8 @@ async function main() {
     // 一次 run 能同时挂几十条连接，把本机网络栈和中转站一起拖慢（真实事故）。
     // 优先级：--max-inflight > SWARM_MAX_INFLIGHT（模块初始化已读）> 自适应。
     const maxInflight = flag('max-inflight');
-    const autoInflight = Math.min(64, Math.max(8, maxWorkers * 4));
+    // 无上限模式（maxWorkers=0）下 in-flight 闸门按 64 顶格（护栏会拦机器过载）。
+    const autoInflight = Math.min(64, Math.max(8, (maxWorkers || 16) * 4));
     if (maxInflight !== null && maxInflight !== true) setMaxInflight(maxInflight);
     else if (process.env.SWARM_MAX_INFLIGHT) { /* 环境变量已生效，尊重它 */ }
     else setMaxInflight(autoInflight);
@@ -156,6 +160,7 @@ async function main() {
     const kvPairs = { mission, testCmd, harness, model, maxWorkers, minWorkers, maxTurns, leaseSec, conventions, apiBase };
     for (const [k, v] of Object.entries(kvPairs)) if (v != null) store.setKv(k, typeof v === 'string' ? v : JSON.stringify(v));
     if (kvBootstrap) kvBootstrap.close();
+    if (maxWorkers === 0) console.log('[swarm] max-workers=0：无静态上限，worker 数由任务量 + 资源护栏动态决定');
     // --log-file：把 store 事件旁路写成 NDJSON（一行一个 JSON），供 agent tail -f 读。
     let logStream = null;
     if (logFile) {

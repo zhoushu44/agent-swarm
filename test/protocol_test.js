@@ -347,7 +347,32 @@ async function scenarioMinWorkersFloor() {
   fs.rmSync(repoDir, { recursive: true, force: true });
 }
 
-// ---------- 场景 12：拆解幂等按"归一化交付物名"折叠（重复拆解是收敛杀手） ----------
+// ---------- 场景 9b：maxWorkers=0 无静态上限，纯靠任务量驱动扩容 ----------
+// 20 个待办项时，旧 maxWorkers 默认（如 8）会卡住并行度；0 表示不设上限，
+// want 只由 demand（open 任务数）决定。资源护栏在本测试关闭（离线）。
+async function scenarioUnlimitedWorkers() {
+  const repoDir = tmpRepo();
+  const repo = new Repo(repoDir); repo.init();
+  const store = new Store(path.join(repoDir, '.swarm', 'state.db'));
+  for (let i = 1; i <= 20; i++) store.addItem({ id: `u${i}`, title: `task ${i}`, createdBy: 'test' });
+  const PORT = 17896;
+  const { server } = await createServer(store, { port: PORT });
+  const runner = new Runner({ resourceGuard: false,
+    store, repoRoot: repoDir, serverPort: PORT, harness: 'echo',
+    mission: 'unlimited workers test', testCmd: null,
+    maxTurns: 99, idleTurnsToExit: 99, minWorkers: 1, maxWorkers: 0,
+  });
+  runner.echoScripts = { '*': 'say IDLE' };
+  runner.startAutoscaler();
+  await runner.spawnWorker('w1');
+  // open=20 → demand=20 → capped=min(20, max(8,40))=20 → want=20（无上限钳制）
+  await waitFor(() => activeCount(runner) >= 12, { label: 'unbounded autoscale past old default', timeoutMs: 60000 });
+  check('maxWorkers=0：扩容突破静态上限（active >= 12）', activeCount(runner) >= 12, `active=${activeCount(runner)}`);
+  check('maxWorkers=0：status 报告 maxWorkers=null（动态）', runner.status().maxWorkers === null);
+
+  await runner.stop(); server.close(); store.close();
+  fs.rmSync(repoDir, { recursive: true, force: true });
+}
 // EXP4 实测：10 个 worker 把同一个 big 重拆成 91/64 个重复子项（本应 10 个）。
 // 根因是 (parent, title) 精确去重挡不住 LLM 的标题变体。本场景直接打 HTTP，
 // 用同一交付物的多种写法建子项，断言只落 1 个；不同交付物仍各自独立。
@@ -1119,6 +1144,7 @@ export async function run() {
   await scenarioIntegrationIsolation();
   await scenarioDeepAutoscale();
   await scenarioMinWorkersFloor();
+  await scenarioUnlimitedWorkers();
   await scenarioSplitDedup();
   await scenarioJudgeDedup();
   await scenarioReaper();

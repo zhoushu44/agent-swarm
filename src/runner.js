@@ -791,7 +791,10 @@ export class Runner {
       // 任务比例护栏：并行度跟随真实可认领任务数，别让多余 worker 空转抢同一批任务
       // （空转 + 重复子项 + 限流）。上限 = max(8, open*2)，下限仍由 minWorkers 保证。
       const capped = Math.min(demand, Math.max(8, open * 2));
-      let want = Math.min(this.maxWorkers, Math.max(this.minWorkers, capped));
+      // maxWorkers=0 表示"无静态上限"：扩容完全由任务量 + 运行时资源护栏动态决定
+      // （CPU>80% 停扩、CPU>92% 主动缩、可用内存<15% 停扩、<8% 主动缩）。
+      const ceilingByMax = this.maxWorkers > 0 ? this.maxWorkers : Infinity;
+      let want = Math.min(ceilingByMax, Math.max(this.minWorkers, capped));
       // 系统资源护栏：机器喘不过气时把 want 钳到护栏上限（high=只许停不许扩，
       // critical=主动缩一个）。与任务比例护栏串联——两层取最小，谁紧听谁的。
       // 事件只在压力档位变化时记（每秒一轮的循环不能刷屏）。
@@ -1022,7 +1025,7 @@ export class Runner {
       active,
       peakActive: this._peakActive || active,
       minWorkers: this.minWorkers,
-      maxWorkers: this.maxWorkers,
+      maxWorkers: this.maxWorkers || null, // 0 → null：无静态上限（监控面板显示为动态）
       testCmd: this.testCmd || null,
       startedAt: this._startedAt || null,
       briefEnabled: this.briefEnabled,

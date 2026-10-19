@@ -355,7 +355,7 @@ export function dashboardHtml() {
       { k: 'done', v: done + ' / ' + total, cls: 'done', tone: 'done' },
       { k: 'pending', v: st.pending || 0, cls: 'pending', tone: 'pending' },
       { k: 'submitted', v: st.submitted || 0, cls: 'submitted', tone: 'active' },
-      { k: 'active agents', v: (status.active || 0) + ' / ' + (status.maxWorkers || '?'), cls: '', tone: 'active' },
+      { k: 'active agents', v: (status.active || 0) + ' / ' + (status.maxWorkers || '∞'), cls: '', tone: 'active' },
       { k: 'peak', v: status.peakActive || 0, cls: '', tone: 'peak' },
       { k: 'uptime', v: fmtDur(status.startedAt ? Date.now() - status.startedAt : null), cls: '', tone: 'neutral' },
       { k: 'progress', v: pct + '%', cls: '', tone: 'peak' },
