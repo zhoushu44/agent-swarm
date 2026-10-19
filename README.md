@@ -41,6 +41,46 @@ powershell -NoProfile -ExecutionPolicy Bypass -File bench.ps1 -Side js -WorkDir 
 
 `bench.ps1` walks the process tree each 5s sample and records the leaf `swarm.exe` / `node.exe` WorkingSet64 + CPU — sampling the `cmd /c` wrapper returns ~0 and is the reason earlier runs reported a bogus "6.7MB持平".
 
+## v5.2.0: speed pass (parallel tool calls + AIMD slow start)
+
+v5.2.0 (this tree) attacks LLM-round latency on two axes:
+
+- **Parallel tool calls** ([internal/harness/agentloop.go](internal/harness/agentloop.go)) — when the model emits multiple independent `tool_calls` in one round (e.g. `write(a.js)` + `write(b.js)`), they now fan out to goroutines instead of executing serially. Results are appended in original order so the transcript stays deterministic. `finish` still short-circuits.
+- **AIMD slow start** ([internal/harness/adaptive.go](internal/harness/adaptive.go)) — before the first 429/503, the inflight window **doubles** every 8 successful calls (64 → 128 → 256 → …, log₂(n) rounds to capacity) instead of creeping +1. The first rate-limit permanently switches back to classic AIMD additive increase.
+- **Prompt BATCH instruction** ([internal/prompts/body.go](internal/prompts/body.go)) — tells the model to emit independent actions as parallel tool calls in one round, only serializing when a later call consumes an earlier call's output.
+- **workers default 16** (was 8) — more lanes to keep the wider inflight window saturated.
+
+### v5.2.0 benchmark (20 `util/*` tasks, deepseek-v4-flash, 16 workers)
+
+3 runs, all 20/20 done, zero divergence:
+
+| run | wall | apiCalls | input tokens | output tokens |
+|---|---|---|---|---|
+| 1 | **71.2s** | 380 | 2.53M | 54k |
+| 2 | 81.4s | 407 | 2.84M | 63k |
+| 3 | 122.1s | 413 | 2.95M | 65k |
+| **mean** | **91.6s** | 400 | 2.77M | 61k |
+
+Peak vs v5.1.0 (83.3s): **−17%**. Vs JS v3.1.0 (98.5s): **−46%**. Wall variance is dominated by LLM sampling luck on the long-tail critical path (run 3 had two workers stall ~20s at 18/20).
+
+## v5.3.0: measured-and-rejected experiments
+
+Two first-principles ideas were implemented, gated behind flags, and **benchmarked on a heterogeneous task set** (18 small utils + 3 large tasks: `lib/eventEmitter`, `lib/promisePool`, `lib/lruCache` — designed to create a long tail). Both lost. Code reverted in v5.3.0; the data is kept here so the ideas don't get re-proposed without new evidence.
+
+| config | wall | done | apiCalls | input tokens | verdict |
+|---|---|---|---|---|---|
+| baseline | **100.6s** | 21/21 | 408 | 2.87M | — |
+| `--aggressive-split` (big items split after 1–2 held turns) | 151.7s | 21/21 | 402 | 2.88M | **+51% wall** |
+| `--speculative` (2 workers race one item, first submit wins) | 187.6s | 21/21 | 784 | **7.34M** | **+86% wall, 2.6× tokens** |
+| both on | 355.6s | 29/29 (8 split children) | 1072 | **11.2M** | **+253% wall, 3.9× tokens** |
+
+**Why they lost:**
+
+- **aggressive-split** serializes the critical path — splitting one big task into "core" + "tests" children means child B can't claim until the integrator merges child A. On a 21-task / 16-worker board the workers are rarely idle, so the split never finds a free lane; it just adds an integration barrier.
+- **speculative** burns 2× tokens on the raced item but the winner doesn't finish *faster* than a solo worker would have — the loser is pure waste. And because the board has more items than workers, the "idle worker picks up a raced item" scenario never materializes; racers displace *other* useful work.
+
+Both mechanisms are sound in the regime they were designed for (very few huge items, many idle workers) — that regime just isn't this benchmark, and isn't the common case.
+
 ## v5.1.0 fixes driven by this benchmark
 
 1. **Agent loop** ([internal/harness/agentloop.go](internal/harness/agentloop.go)) — 4-tool loop (bash/write/http/finish) ported from JS `harness.js`. Without it Go workers returned after one completion and the benchmark could not run at all.
