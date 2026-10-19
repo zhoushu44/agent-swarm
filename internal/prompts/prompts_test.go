@@ -149,6 +149,20 @@ func TestRenderHardRulesOrderAndFormat(t *testing.T) {
 	}
 }
 
+// TestRenderHardRulesTieBreakIsByID pins the tie-break: rules sharing a priority
+// render in ID order, exactly like the JS original
+// (sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id))).
+func TestRenderHardRulesTieBreakIsByID(t *testing.T) {
+	rules := []Rule{
+		{ID: "zebra", Priority: 0, Category: "c", Text: "z"},
+		{ID: "alpha", Priority: 0, Category: "c", Text: "a"},
+		{ID: "mike", Priority: 0, Category: "c", Text: "m"},
+	}
+	if got, want := RenderHardRules(rules), "- a\n- m\n- z"; got != want {
+		t.Fatalf("RenderHardRules tie-break = %q, want %q", got, want)
+	}
+}
+
 func TestRenderHardRulesDoesNotMutateInput(t *testing.T) {
 	rules := []Rule{
 		{ID: "b", Priority: 5, Text: "b"},
@@ -171,10 +185,47 @@ func TestDefaultRulesRenderAllRules(t *testing.T) {
 			t.Fatalf("rule %s missing from rendered output", r.ID)
 		}
 	}
-	// priority 0 rules must come first
-	if !strings.HasPrefix(out, "- One claim at a time.") {
-		t.Fatalf("highest-priority rule should be first, got %q", lines[0])
+
+	// Every priority-0 rule must render before any lower-priority rule, and the
+	// first line must be the lowest-ID priority-0 rule (render order is
+	// priority asc, then ID asc).
+	want := sortedRules(DefaultRules)
+	firstLow := len(want)
+	for i, r := range want {
+		if r.Priority > 0 {
+			firstLow = i
+			break
+		}
 	}
+	if firstLow == len(want) {
+		t.Fatalf("default registry has no non-zero priority rule; test cannot pin ordering")
+	}
+	for i := firstLow; i < len(want); i++ {
+		if want[i].Priority == 0 {
+			t.Fatalf("priority-0 rule %s rendered after a lower-priority rule", want[i].ID)
+		}
+	}
+	if wantLine := "- " + want[0].Text; lines[0] != wantLine {
+		t.Fatalf("first rendered rule should be %q, got %q", wantLine, lines[0])
+	}
+}
+
+// sortedRules returns rules in render order (priority asc, then ID asc).
+func sortedRules(rules []Rule) []Rule {
+	out := make([]Rule, len(rules))
+	copy(out, rules)
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0; j-- {
+			if out[j-1].Priority < out[j].Priority {
+				break
+			}
+			if out[j-1].Priority == out[j].Priority && out[j-1].ID < out[j].ID {
+				break
+			}
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
 }
 
 func TestValidateRulesCleanRegistry(t *testing.T) {
