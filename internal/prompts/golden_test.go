@@ -1,9 +1,10 @@
-﻿package prompts
+package prompts
 
 import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,22 @@ func goldenCases() []goldenCase {
 	}
 }
 
+// normalizeEOL converts CRLF line endings to LF.
+//
+// The prompt builder always emits LF, but the golden fixtures live in git and
+// on a Windows checkout with core.autocrlf=true (or any editor that saves
+// CRLF) they arrive here with CRLF. Without this the byte comparison below
+// fails on every case even though the prompt is correct. .gitattributes pins
+// testdata/*.golden to LF so a clean checkout is already correct; this is the
+// belt-and-braces half of the fix so the test cannot be broken by a stray
+// tool rewriting the fixtures.
+func normalizeEOL(s string) string {
+	if !strings.Contains(s, "\r\n") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\r\n", "\n")
+}
+
 func TestPromptGolden(t *testing.T) {
 	for _, c := range goldenCases() {
 		c := c
@@ -82,20 +99,22 @@ func TestPromptGolden(t *testing.T) {
 				if err := os.MkdirAll("testdata", 0o755); err != nil {
 					t.Fatalf("mkdir testdata: %v", err)
 				}
-				if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+				// Always write LF so the committed fixture is platform neutral.
+				if err := os.WriteFile(path, []byte(normalizeEOL(got)), 0o644); err != nil {
 					t.Fatalf("write golden: %v", err)
 				}
 				return
 			}
 
-			want, err := os.ReadFile(path)
+			raw, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatalf("read golden %s: %v (run `go test ./internal/prompts/ -run TestPromptGolden -update` to regenerate)", path, err)
 			}
-			if got != string(want) {
-				i := firstDiff(got, string(want))
+			want := normalizeEOL(string(raw))
+			if got != want {
+				i := firstDiff(got, want)
 				t.Fatalf("prompt for case %q changed at byte %d\n got: %q\nwant: %q",
-					c.name, i, sliceAround(got, i, 80), sliceAround(string(want), i, 80))
+					c.name, i, sliceAround(got, i, 80), sliceAround(want, i, 80))
 			}
 		})
 	}
