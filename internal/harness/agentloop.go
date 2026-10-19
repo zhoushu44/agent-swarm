@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -195,10 +196,25 @@ func (d *DirectHarness) RunAgentLoop(ctx context.Context, model, prompt string, 
 			return AgentLoopResult{Reply: orNoReply(lastText), Usage: total, Steps: step + 1, Submitted: submitted}, nil
 		}
 
-		// Execute tool calls; finish short-circuits.
+		// Execute tool calls; finish short-circuits. Independent calls in the same
+		// round run CONCURRENTLY (Go 1.25+ emits parallel tool calls when the model
+		// batches independent ops like "write 3 files"), which collapses what used
+		// to be N sequential round-trips into one. Results are written back in the
+		// ORIGINAL call order so the transcript stays deterministic for the model.
 		finished := false
 		var finishSummary string
-		for _, tc := range msg.ToolCalls {
+		type toolResult struct {
+			id, name, out string
+		}
+		results := make([]toolResult, len(msg.ToolCalls))
+
+		// submitted is mutated by runHTTPTool; guard for the concurrent fan-out.
+		var subMu sync.Mutex
+		subPtr := &submitted
+		setSub := func() { subMu.Lock(); *subPtr = true; subMu.Unlock() }
+
+		var wg sync.WaitGroup
+		for i, tc := range msg.ToolCalls {
 			name := tc.Function.Name
 			var args map[string]any
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
@@ -210,13 +226,21 @@ func (d *DirectHarness) RunAgentLoop(ctx context.Context, model, prompt string, 
 				if s, ok := args["summary"].(string); ok {
 					finishSummary = s
 				}
-				// Do not execute further tools after finish; still record a tool ack.
-				messages = append(messages, loopMessage{Role: "tool", ToolCallID: tc.ID, Name: name, Content: "turn ended"})
+				results[i] = toolResult{tc.ID, name, "turn ended"}
 				continue
 			}
 
-			out := d.execTool(ctx, name, args, cfg, &submitted)
-			messages = append(messages, loopMessage{Role: "tool", ToolCallID: tc.ID, Name: name, Content: out})
+			wg.Add(1)
+			go func(i int, tcID, name string, args map[string]any) {
+				defer wg.Done()
+				out := d.execToolConcurrent(ctx, name, args, cfg, setSub)
+				results[i] = toolResult{tcID, name, out}
+			}(i, tc.ID, name, args)
+		}
+		wg.Wait()
+
+		for _, r := range results {
+			messages = append(messages, loopMessage{Role: "tool", ToolCallID: r.id, Name: r.name, Content: r.out})
 		}
 
 		if finished {
@@ -297,7 +321,26 @@ func (d *DirectHarness) execTool(ctx context.Context, name string, args map[stri
 		return runWriteTool(file, cfg.WorkDir)
 	case "http":
 		req, _ := args["request"].(string)
-		return runHTTPTool(ctx, req, cfg.ServerPort, submitted)
+		return runHTTPTool(ctx, req, cfg.ServerPort, func() { *submitted = true })
+	default:
+		return "unknown tool: " + name
+	}
+}
+
+// execToolConcurrent is the fan-out variant: takes a setSubmitted callback
+// instead of a bare pointer so concurrent http tool calls can mark submission
+// without a data race.
+func (d *DirectHarness) execToolConcurrent(ctx context.Context, name string, args map[string]any, cfg AgentLoopConfig, setSubmitted func()) string {
+	switch name {
+	case "bash":
+		cmd, _ := args["cmd"].(string)
+		return runBashTool(ctx, cmd, cfg.WorkDir, cfg.BashTimeout)
+	case "write":
+		file, _ := args["file"].(string)
+		return runWriteTool(file, cfg.WorkDir)
+	case "http":
+		req, _ := args["request"].(string)
+		return runHTTPTool(ctx, req, cfg.ServerPort, setSubmitted)
 	default:
 		return "unknown tool: " + name
 	}
@@ -375,7 +418,7 @@ func runWriteTool(fileJSON, dir string) string {
 
 // runHTTPTool calls the local swarm server. request is JSON {method,path,...fields}.
 // GET fields become query params; POST fields become the JSON body.
-func runHTTPTool(ctx context.Context, requestJSON string, port int, submitted *bool) string {
+func runHTTPTool(ctx context.Context, requestJSON string, port int, setSubmitted func()) string {
 	method, path, fields := normalizeHTTPInput(requestJSON)
 	if path == "" {
 		return "http failed: missing path"
@@ -424,7 +467,7 @@ func runHTTPTool(ctx context.Context, requestJSON string, port int, submitted *b
 	}
 	out := fmt.Sprintf("%d %s", resp.StatusCode, text)
 	if method == "POST" && path == "/submit" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		*submitted = true
+		setSubmitted()
 	}
 	return out
 }

@@ -14,6 +14,32 @@ func TestAdaptiveBaseline(t *testing.T) {
 	}
 }
 
+func TestAdaptiveSlowStartDoubles(t *testing.T) {
+	s := NewAdaptiveSemaphore(8)
+	// 8 OKs with no rate-limit → window doubles 8→16 (and ceiling with it).
+	for i := 0; i < 8; i++ {
+		s.NoteOK()
+	}
+	if s.Limit() != 16 || s.Ceiling() != 16 {
+		t.Fatalf("after 8 OKs: limit=%d ceiling=%d, want 16/16 (slow start double)", s.Limit(), s.Ceiling())
+	}
+	for i := 0; i < 8; i++ {
+		s.NoteOK()
+	}
+	if s.Limit() != 32 || s.Ceiling() != 32 {
+		t.Fatalf("after 16 OKs: limit=%d ceiling=%d, want 32/32", s.Limit(), s.Ceiling())
+	}
+	// First rate-limit ends slow start; subsequent OKs revert to additive AIMD.
+	s.NoteRateLimit()
+	lim := s.Limit()
+	for i := 0; i < 8; i++ {
+		s.NoteOK()
+	}
+	if s.Limit() != lim+1 {
+		t.Fatalf("post-rate-limit: limit=%d, want %d (AIMD +1, slow start OFF)", s.Limit(), lim+1)
+	}
+}
+
 func TestAdaptiveRateLimitPinsWatermark(t *testing.T) {
 	s := NewAdaptiveSemaphore(64)
 	// concurrency climbed to 20 when the relay started 503ing

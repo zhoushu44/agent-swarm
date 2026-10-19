@@ -30,6 +30,11 @@ type AdaptiveSemaphore struct {
 	hiWater  int       // peak concurrency since last pin (rejections lag releases)
 	okStreak int       // consecutive successes since last rate-limit
 	lastBack time.Time // storm throttle: only first 503 in a window backs off
+	// slowStart is true until the FIRST rate-limit: the window doubles every 8
+	// OKs (TCP-style slow start) instead of creeping +1, so a healthy run ramps
+	// to real capacity in O(log n) rounds instead of O(n). The first 429/503
+	// flips it off permanently — from then on AIMD governs.
+	slowStart bool
 
 	waitq []chan struct{}
 }
@@ -40,7 +45,7 @@ func NewAdaptiveSemaphore(n int) *AdaptiveSemaphore {
 	if n <= 0 {
 		n = 1
 	}
-	return &AdaptiveSemaphore{limit: n, ceiling: n}
+	return &AdaptiveSemaphore{limit: n, ceiling: n, slowStart: true}
 }
 
 // Limit reports the current concurrency limit (the AIMD-controlled value).
@@ -146,6 +151,7 @@ func (s *AdaptiveSemaphore) NoteRateLimit() {
 		return
 	}
 	s.okStreak = 0
+	s.slowStart = false // first rate-limit ends slow start permanently
 	now := time.Now()
 	if !s.lastBack.IsZero() && now.Sub(s.lastBack) < 2*time.Second {
 		return // 503 storm: first rejection already backed off
@@ -186,6 +192,13 @@ func (s *AdaptiveSemaphore) NoteOK() {
 	}
 	s.okStreak++
 	if s.okStreak%8 != 0 {
+		return
+	}
+	// Slow start: no rate-limit seen yet → double the window (and the capacity
+	// estimate) every 8 OKs. Reaches the server's real limit in log2(n) rounds.
+	if s.slowStart {
+		s.ceiling *= 2
+		s.setLimitLocked(s.limit*2, false)
 		return
 	}
 	if s.limit < s.ceiling {

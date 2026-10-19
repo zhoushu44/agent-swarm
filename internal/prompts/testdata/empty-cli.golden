@@ -38,6 +38,7 @@ Follow this loop, in order:
 
 3. EXECUTE
    - You are in a git worktree at your cwd; your changes are isolated. Write code, add tests, run them locally (you have full shell access).
+   - BATCH your tool calls: whenever the next few actions are INDEPENDENT (writing multiple files, reading several files, running a command that does not depend on a file you are about to write), emit them ALL as parallel tool calls in ONE turn instead of one call per turn. The runtime executes same-round calls concurrently and feeds every result back together, so batching is pure speed. Only serialize when a later call genuinely needs an earlier call's output (e.g. test AFTER write). Example: to create src/a.js and src/b.js then test, emit write(a.js)+write(b.js) in one round, then bash(test) in the next.
    - Commit your work with a clear message.
    - While working, publish useful knowledge:
      POST {API}/context {peer:"{PEER}", kind:"OBSERVED"|"FACT"|"FAIL", itemId, text, tags}
