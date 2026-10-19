@@ -10,9 +10,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,18 +69,70 @@ func main() {
 
 	case "run":
 		if len(args) < 1 {
-			fmt.Fprintf(os.Stderr, "usage: swarm run <dir> [--max-workers N]\n")
+			fmt.Fprintf(os.Stderr, "usage: swarm run <dir> [flags]\n")
 			os.Exit(1)
 		}
 		dir := args[0]
-		maxWorkers := 8
+		cfg := defaultRunConfig()
 		for i := 1; i < len(args); i++ {
-			if args[i] == "--max-workers" && i+1 < len(args) {
-				fmt.Sscanf(args[i+1], "%d", &maxWorkers)
-				i++
+			sw := func(dst *string) {
+				if i+1 < len(args) {
+					*dst = args[i+1]
+					i++
+				}
+			}
+			iw := func(dst *int) {
+				if i+1 < len(args) {
+					fmt.Sscanf(args[i+1], "%d", dst)
+					i++
+				}
+			}
+			i64 := func(dst *int64) {
+				if i+1 < len(args) {
+					fmt.Sscanf(args[i+1], "%d", dst)
+					i++
+				}
+			}
+			switch args[i] {
+			case "--max-workers":
+				iw(&cfg.maxWorkers)
+			case "--min-workers":
+				iw(&cfg.minWorkers)
+			case "--workers":
+				iw(&cfg.initialWorkers)
+			case "--max-turns":
+				iw(&cfg.maxTurns)
+			case "--lease-sec":
+				iw(&cfg.leaseSec)
+			case "--max-items":
+				iw(&cfg.maxItems)
+			case "--max-item-turns":
+				iw(&cfg.maxItemTurns)
+			case "--max-item-tokens":
+				iw(&cfg.maxItemTokens)
+			case "--max-item-fails":
+				iw(&cfg.maxItemFails)
+			case "--budget-tokens":
+				i64(&cfg.budgetTokens)
+			case "--server-port":
+				iw(&cfg.serverPort)
+			case "--harness":
+				sw(&cfg.harnessName)
+			case "--api-base":
+				sw(&cfg.apiBase)
+			case "--api-key":
+				sw(&cfg.apiKey)
+			case "--model":
+				sw(&cfg.model)
+			case "--mission":
+				sw(&cfg.mission)
+			case "--conventions":
+				sw(&cfg.conventions)
+			case "--test-cmd":
+				sw(&cfg.testCmd)
 			}
 		}
-		if err := cmdRun(dir, maxWorkers); err != nil {
+		if err := cmdRun(dir, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "run: %v\n", err)
 			os.Exit(1)
 		}
@@ -183,19 +235,20 @@ func cmdSeed(dir, file string) error {
 	return nil
 }
 
-func cmdRun(dir string, maxWorkers int) error {
+func cmdRun(dir string, cfg runConfig) error {
 	st, err := openStore(dir)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	// TODO: wire up runner + autoscaler + integrator
-	// For now, just start the HTTP server so workers can connect
-	srv := server.New(st)
-	fmt.Printf("swarm server listening on :8080 (maxWorkers=%d)\n", maxWorkers)
-	fmt.Printf("press Ctrl+C to stop\n")
-	return http.ListenAndServe(":8080", srv)
+	r, err := newSwarmRunner(dir, cfg, st)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("swarm run: dir=%s workers=%d maxWorkers=%d port=%d harness=%s\n",
+		dir, cfg.initialWorkers, cfg.maxWorkers, cfg.serverPort, cfg.harnessName)
+	return r.run(context.Background())
 }
 
 func cmdBoard(dir string) error {
