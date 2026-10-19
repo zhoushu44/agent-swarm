@@ -56,10 +56,16 @@ export class Semaphore {
   noteRateLimit() {
     if (this.limit <= 0) return;
     this._okStreak = 0;
+    // 503 风暴节流：同一次过载风暴里多个请求几乎同时 503，只让第一个做钉顶+回退，
+    // 其余在冷却窗（2s）内直接跳过——否则 N 个并发 503 会连续乘性回退把 limit 打塌到 1。
+    const now = Date.now();
+    if (this._lastBackoffAt && now - this._lastBackoffAt < 2000) return;
+    this._lastBackoffAt = now;
     // 用峰值水位而非当前 active：真实路径先 release() 再 noteRateLimit()，
     // 503 到达时部分并发早已释放，active 会系统性低估撞限水位。
     const hitLevel = Math.max(1, this._hiWater || this.active);
-    if (hitLevel < this.ceiling) { this.ceiling = hitLevel; this._hiWater = 0; }
+    if (hitLevel < this.ceiling) this.ceiling = hitLevel;
+    this._hiWater = 0; // 水位已消费：重置后下一轮重新累积真实峰值，否则旧峰值残留导致后续撞限学不到更低水位
     // 回退基数取 min(limit, ceiling)（即容量水位）：以 64 上限撞到容量 20 时，
     // 退到 15（容量下 25% 卸压）而非 48（仍在容量之上继续压服务端）。
     const backed = Math.max(1, Math.floor(Math.min(this.limit, this.ceiling) * 0.75));
@@ -69,10 +75,16 @@ export class Semaphore {
   }
   noteOk() {
     if (this.limit <= 0) return;
-    // 成功且已顶到当前上限 → 服务端还有余量，天花板 +1 上探（动态扩容）
-    if (this.limit >= this.ceiling) { this.ceiling = this.limit + 1; }
     this._okStreak += 1;
-    if (this._okStreak >= 8) { this._okStreak = 0; this.setLimit(this.limit + 1); }
+    if (this._okStreak % 8 !== 0) return;
+    // 容量内加性回升：+1（AIMD 的 AI），不越过钉顶水位——撞限后的保守恢复期。
+    if (this.limit < this.ceiling) { this.setLimit(this.limit + 1); return; }
+    // 顶格持续成功 → 服务端可能已扩容/恢复，天花板动态上探（不永久钉死）。
+    // 步长随持续健康度放大：streak≥64 → +2，≥256 → +4。服务器恢复后吞吐
+    // 能较快爬回甚至超越撞限前水平；一旦再撞限 streak 立即归零回到最保守 +1。
+    const probe = 1 + (this._okStreak >= 64 ? 1 : 0) + (this._okStreak >= 256 ? 2 : 0);
+    this.ceiling += probe;
+    this.setLimit(this.limit + 1);
   }
 }
 const apiGate = new Semaphore(resolveMaxInflight());

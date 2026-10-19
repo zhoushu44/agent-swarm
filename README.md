@@ -365,6 +365,13 @@ autoscaler 是独立异步循环，只看 board 计数（不看内容）：
 进程级信号量把"在飞 API 请求数"钳在上限内（默认 `clamp(workers×4, 8, 64)`，
 `--max-inflight` / `SWARM_MAX_INFLIGHT` 覆盖，`0` = 不限流）。
 
+闸门是 **AIMD 自适应**（加性增/乘性减，v3.0 起）：
+
+- **撞限钉顶**：429/503 时把"本轮峰值并发水位"钉为新 ceiling（服务器开始拒绝的那一刻的并发数就是它的真实容量），然后 0.75x 乘性回退到其下。
+- **hiWater 峰值追踪**：撞限水位用本轮峰值而非当前 active——并发请求里先 Release 的会把 active 拉低，用 active 会低估真实撞限水位。
+- **风暴节流**：2s 冷却窗内多个 503 只回退一次，避免 N 个并发失败把 limit 乘到 1。
+- **恢复上探**：持续成功时每 8 次 OK 加性 +1 回升到 ceiling；顶格后按成功 streak 分档继续上探（≥64 → +2，≥256 → +4）。服务器恢复后不会被永久钉在低位，会自动爬回去。
+
 > 2026-10 修正：旧默认是 `max(64, workers)`——在只有 2~6 个 worker 的小机器上闸门等于形同虚设，
 > 一次 run 能同时挂几十条连接，把本机网络栈和中转站一起拖慢。现在跟随 worker 数自适应，
 > 下限 8 防止并发过低拖长墙钟，上限 64 防止撞 429 反而更慢。
@@ -458,9 +465,13 @@ worker 手头无租约、board 也无 claimable 项时退避轮询，不烧 LLM 
 |---|---|---|---|---|
 | 1️⃣ | ≤ 200 | 单进程 Node | 已完成 | ✅ 稳定运行 |
 | 2️⃣ | 200-800 | worker_threads | 1-2 天 | 🔲 需要时再做 |
-| 3️⃣ | 1000+ | Go 重写 | 1-2 周 | 🔲 远期目标 |
+| 3️⃣ | 1000+ | Go 重写 | 已完成 | ✅ `swarm-go/` 单二进制（v4.0） |
 
-**不要现在换 Go**——等实测撞到墙了再升级。
+### Go 版（v4.0，`swarm-go/`）
+
+`swarm-go/` 是 Go 重写版，单二进制零依赖（`go build -o swarm.exe ./cmd/swarm`），sqlite 用纯 Go 驱动 `modernc.org/sqlite`。cmdRun 组装层已补齐：worker 池 / autoscaler / integrator / renewer / reaper / sysload 护栏 / AIMD 闸门全量接通，`go test ./...` 全绿。
+
+已知差异（暂未移植）：批量不相交分组集成（逐条集成，语义等价吞吐略低）、syncWorktree epoch 短路、per-item token 记账、慢任务/返工循环检测、dashboard。其余语义与 JS 版对齐。
 
 ## harness 一览
 
