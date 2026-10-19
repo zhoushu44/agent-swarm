@@ -35,32 +35,37 @@ type runConfig struct {
 	maxItemTokens   int
 	budgetTokens    int64
 	maxItemFails    int
-	testCmd         string
-	mission         string
-	conventions     string
-	serverPort      int
-	harnessName     string // "echo" for offline tests, "direct" for OpenAI-compatible
-	apiBase         string
-	apiKey          string
-	model           string
-	exitWhenDone    bool
+	// maxNoProgressTurns parks a worker as crashed after this many consecutive
+	// turns that end with no submission and no idle — i.e. the endpoint is not
+	// driving tools. See the no-progress guard in workerLoop.
+	maxNoProgressTurns int
+	testCmd            string
+	mission            string
+	conventions        string
+	serverPort         int
+	harnessName        string // "echo" for offline tests, "direct" for OpenAI-compatible
+	apiBase            string
+	apiKey             string
+	model              string
+	exitWhenDone       bool
 }
 
 func defaultRunConfig() runConfig {
 	return runConfig{
-		maxWorkers:      1000,
-		minWorkers:      1,
-		initialWorkers:  8,
-		maxTurns:        10,
-		hardTurnFactor:  6,
-		idleTurnsToExit: 2,
-		leaseSec:        300,
-		maxItems:        200,
-		maxItemTurns:    6,
-		maxItemTokens:   2_000_000,
-		maxItemFails:    3,
-		serverPort:      17771,
-		harnessName:     "direct",
+		maxWorkers:         1000,
+		minWorkers:         1,
+		initialWorkers:     8,
+		maxTurns:           10,
+		hardTurnFactor:     6,
+		idleTurnsToExit:    2,
+		leaseSec:           300,
+		maxItems:           200,
+		maxItemTurns:       6,
+		maxItemTokens:      2_000_000,
+		maxItemFails:       3,
+		maxNoProgressTurns: 3,
+		serverPort:         17771,
+		harnessName:        "direct",
 	}
 }
 
@@ -107,10 +112,15 @@ type workerState struct {
 	lastDigestTs      int64
 	itemHold          *itemHold
 	rateLimitedStreak int
-	loopDone          bool
-	reapFailCount     int
-	reapFailAt        time.Time
-	tokenUsage        workerUsage
+	// noProgressStreak counts consecutive turns that ended WITHOUT a submission
+	// and without going idle — the signature of a model that ignores tool_choice
+	// and replies in plain prose. Past maxNoProgressTurns the worker is parked as
+	// crashed so it stops burning tokens on a endpoint it cannot drive.
+	noProgressStreak int
+	loopDone         bool
+	reapFailCount    int
+	reapFailAt       time.Time
+	tokenUsage       workerUsage
 }
 
 type itemHold struct {
@@ -421,6 +431,7 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 		var result harness.Response
 		var err error
 		loopSteps := 0
+		loopSubmitted := false
 		if r.cfg.harnessName == "echo" {
 			result, err = r.harness.Complete(ctx, harness.Request{
 				Messages: []harness.Message{{Role: harness.RoleUser, Content: prompt}},
@@ -436,6 +447,7 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 					})
 					result = harness.Response{Text: lr.Reply, Usage: lr.Usage}
 					loopSteps = lr.Steps
+					loopSubmitted = lr.Submitted
 				} else {
 					result, e = r.harness.Complete(ctx, harness.Request{
 						Model:    r.cfg.model,
@@ -486,6 +498,7 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 		if isIdle {
 			w.idleCount++
 			w.status = "idle"
+			w.noProgressStreak = 0
 			open, _ := r.store.OpenCount()
 			if open == 0 && w.idleCount >= r.cfg.idleTurnsToExit && r.activeCount() > r.cfg.minWorkers {
 				w.status = "retired"
@@ -498,6 +511,23 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			}
 		} else {
 			w.idleCount = 0
+			// No-progress guard (direct harness only): a turn that ends with NO
+			// submission and is NOT idle means the model never drove a tool to
+			// completion — the signature of an endpoint that ignores tool_choice and
+			// replies in plain prose. Without this, such a worker loops forever: each
+			// turn re-holds its claim, the item stays in_progress, and tokens burn at
+			// 0 submissions. Park the worker as crashed past the threshold so it stops
+			// spending; the deferred releaseWorkerClaims returns its item to pending.
+			if r.cfg.harnessName != "echo" && !loopSubmitted && err == nil {
+				w.noProgressStreak++
+				if w.noProgressStreak >= r.cfg.maxNoProgressTurns {
+					fmt.Fprintf(os.Stderr, "[swarm] %s parked: %d turns with no submission (endpoint likely ignores tool_choice / non-agent model)\n", w.name, w.noProgressStreak)
+					w.status = "crashed"
+					return
+				}
+			} else {
+				w.noProgressStreak = 0
+			}
 			// Item hold circuit breaker: abandon after maxItemTurns or maxItemTokens.
 			claims, _ := r.store.ActiveClaimsByPeer(w.name)
 			for _, c := range claims {

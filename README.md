@@ -49,6 +49,14 @@ Two layers of defense:
 
 Net effect: **any** OpenAI-compatible endpoint now works regardless of whether it honors `tool_choice` — compliant endpoints are unaffected (first turn already returns tool_calls), non-compliant ones get re-primed into working instead of silently no-oping.
 
+## v5.8.0: no-progress guard — stop burning tokens on endpoints the model can't drive
+
+v5.4's retry guard fixed *mislabeling* a plain-text turn as "done". But it left a worse failure mode open: on a task the model genuinely cannot drive tools for (too complex, long multi-step chain, weak endpoint), the agent loop retries 3×, gives up, returns `Submitted:false` — and the runner **ignored that flag**. The worker stayed `working`, kept its claim, and re-ran the same prompt next turn. Result: an infinite plain-text retry loop. Observed signature: token rate pulses (burst → 0 → burst), `pending` drains to 0 but `submtd=0`, workers stuck `working`, ~1.3M tokens burned in 6 min with **zero submissions**.
+
+Fix (`runner.go`): the runner now consumes `AgentLoopResult.Submitted`. A turn that ends with **no submission and not idle** increments `noProgressStreak`; past `maxNoProgressTurns` (default 3) the worker is parked as `crashed` with a clear log line, and the loop's deferred `releaseWorkerClaims` returns its item to `pending` for another worker (or a fixed endpoint) to pick up. Compliant endpoints are unaffected — a normal turn either submits or goes idle, both of which reset the streak.
+
+This is a **stop-loss**, not a cure: if the model truly can't drive tools for a task, no worker will complete it — the guard just makes the failure fast, visible, and cheap (bounded token spend) instead of an infinite silent burn.
+
 ## Benchmark: Go v5.1.0 vs JS v3.1.0
 
 Real-token benchmark: 20 `util/*` tasks, deepseek-v4-flash, 8 workers, `--exit-when-done`. Both sides run the same mission constraint ("only the 20 seeded utils, no infrastructure items"). Metrics sampled from the real leaf process (`swarm.exe` / `node.exe`), not the `cmd.exe` wrapper.
