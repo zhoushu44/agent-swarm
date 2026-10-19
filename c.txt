@@ -1,0 +1,8 @@
+[swarm/w-w10 d4e7e1c] feat(gitutil): worktrees, branch mgmt, gated integrate with rollback
+ 6 files changed, 980 insertions(+)
+ create mode 100644 internal/gitutil/gitutil.go
+ create mode 100644 internal/gitutil/gitutil_test.go
+ create mode 100644 internal/gitutil/integrate.go
+ create mode 100644 internal/gitutil/integrate_test.go
+ create mode 100644 internal/gitutil/paths.go
+ create mode 100644 internal/gitutil/worktree.go

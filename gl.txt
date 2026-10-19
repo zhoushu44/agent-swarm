@@ -1,0 +1,2 @@
+d4e7e1c feat(gitutil): worktrees, branch mgmt, gated integrate with rollback
+e5510d3 integrate w5 (t0b929d3a)
