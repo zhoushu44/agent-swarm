@@ -19,6 +19,25 @@ Behavior:
 - **Scale down**: if `want < active`, retire **idle** workers only — a worker mid-task is never killed. Under `--exit-when-done` the floor (`minWorkers`) drops to 0 so the pool drains completely at the end.
 - **Net effect for a day-long run**: `seed 500 → initial --workers 16 → backlog builds → pool grows toward --max-workers → tail clears → workers retire → last few finish`. The ceiling is never the worker count; the real limiters are the LLM API's 429 capacity (governed by the AIMD gate) and the integrator's serial merge.
 
+## Windows worktree locks: self-heal via dev/swarm-clean.ps1
+
+On Windows a swarm run can stall with **zero output** when `.swarm/worktrees/wN` is held by a live process — an open editor/terminal, antivirus scanner, or a zombie `git.exe` left over from a crashed run. `git worktree add` / `RemoveAll` then fail at the OS level and workers never start producing. This is an environment problem, not a swarm logic bug, so swarm deliberately does **not** force-kill file handles (that could kill your editor).
+
+Instead run the bundled cleanup before (re)starting:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File dev/swarm-clean.ps1 -WorkDir <repoDir>
+```
+
+What it does, in order, safe-by-default:
+
+1. kills only **zombie** `git.exe` processes (empty `CommandLine` — never a git command you actually launched)
+2. `git worktree prune` to drop stale registry entries
+3. removes leftover `.swarm/worktrees/*` dirs; a dir still held by a live process is **skipped with a warning**, not force-deleted
+4. **keeps the board db** (`swarm.db` / `state.db`) so board state survives; pass `-ResetDB` only when you want a full reseed (destructive)
+
+If a worktree is still locked after the run, close whatever is holding it and re-run. The same script ships in the `swarm-operator` / `swarm-orchestrator` skills so the agent self-heals automatically before a run.
+
 ## v5.4.0: survive non-compliant tool-calling endpoints
 
 Some endpoints ignore `tool_choice:"required"` and answer in plain prose when the model judges "no tool is needed" (observed on deepseek-v4-flash behind certain proxies, and reproducible on other non-official/self-hosted endpoints — vLLM, relays, middle-tier proxies all vary in `tool_choice` compliance). Previously the agent loop treated `len(tool_calls)==0` as "task complete", so a worker would claim an item, get a plain-text "I'll help you!" reply, and exit having done **nothing** — board shows all `in_progress`, zero output, token flow drops to 0.
