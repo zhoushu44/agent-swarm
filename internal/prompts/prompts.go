@@ -77,6 +77,13 @@ var DefaultRules = []Rule{
 		Text:      "When the board has no suitable work left for you, reply exactly: IDLE",
 		Rationale: "Spinning idle burns API quota; an explicit IDLE lets the runner back off.",
 	},
+	{
+		ID:        "always-call-a-tool",
+		Priority:  0,
+		Category:  "execution",
+		Text:      "NEVER reply with plain text alone. Every turn MUST make at least one tool call (bash/write/http). Plain text performs no work and submits nothing; if you believe the task is done, call http to POST /submit, or finish(summary) only after submitting.",
+		Rationale: "Some endpoints ignore tool_choice and answer in prose; without a tool call nothing is claimed, written, or submitted, so the turn is wasted.",
+	},
 }
 
 // ValidationResult is the outcome of ValidateRules.

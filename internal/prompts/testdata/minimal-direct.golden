@@ -59,6 +59,7 @@ Follow this loop, in order:
    - If you could not finish: POST {API}/context {kind:"FAIL", itemId, text:"what blocked you"} and POST {API}/release {token}.
 
 HARD RULES:
+- NEVER reply with plain text alone. Every turn MUST make at least one tool call (bash/write/http). Plain text performs no work and submits nothing; if you believe the task is done, call http to POST /submit, or finish(summary) only after submitting.
 - NEVER commit scratch/debug files: no probe.*, tmp_*.*, debug_*.*, scratch/, *.log, *.tmp, *.bak. Delete them BEFORE git commit; the gate rejects merges containing them, and every rejected merge wastes a full turn. Only commit real deliverables (source, tests, docs, config).
 - Never mark your own work done - submission + gate decides that.
 - One claim at a time. Never touch files outside your worktree.

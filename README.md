@@ -19,6 +19,17 @@ Behavior:
 - **Scale down**: if `want < active`, retire **idle** workers only — a worker mid-task is never killed. Under `--exit-when-done` the floor (`minWorkers`) drops to 0 so the pool drains completely at the end.
 - **Net effect for a day-long run**: `seed 500 → initial --workers 16 → backlog builds → pool grows toward --max-workers → tail clears → workers retire → last few finish`. The ceiling is never the worker count; the real limiters are the LLM API's 429 capacity (governed by the AIMD gate) and the integrator's serial merge.
 
+## v5.4.0: survive non-compliant tool-calling endpoints
+
+Some endpoints ignore `tool_choice:"required"` and answer in plain prose when the model judges "no tool is needed" (observed on deepseek-v4-flash behind certain proxies, and reproducible on other non-official/self-hosted endpoints — vLLM, relays, middle-tier proxies all vary in `tool_choice` compliance). Previously the agent loop treated `len(tool_calls)==0` as "task complete", so a worker would claim an item, get a plain-text "I'll help you!" reply, and exit having done **nothing** — board shows all `in_progress`, zero output, token flow drops to 0.
+
+Two layers of defense:
+
+- **Runtime guard** (`agentloop.go`): a plain-text reply with no tool call is only a legitimate finish when work was already **submitted**. Otherwise the loop re-primes the model with a hard tool-use instruction and retries (up to 3×), then gives up rather than spinning to MaxSteps. Turns the failure mode from "silent no-op marked done" into "forced to actually call tools".
+- **Prompt hard rule** (`prompts.go` `always-call-a-tool`): NEVER reply with plain text alone; every turn must make at least one tool call. Teaches compliant models to never trigger the guard in the first place.
+
+Net effect: **any** OpenAI-compatible endpoint now works regardless of whether it honors `tool_choice` — compliant endpoints are unaffected (first turn already returns tool_calls), non-compliant ones get re-primed into working instead of silently no-oping.
+
 ## Benchmark: Go v5.1.0 vs JS v3.1.0
 
 Real-token benchmark: 20 `util/*` tasks, deepseek-v4-flash, 8 workers, `--exit-when-done`. Both sides run the same mission constraint ("only the 20 seeded utils, no infrastructure items"). Metrics sampled from the real leaf process (`swarm.exe` / `node.exe`), not the `cmd.exe` wrapper.

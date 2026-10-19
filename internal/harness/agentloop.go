@@ -151,6 +151,14 @@ func (d *DirectHarness) RunAgentLoop(ctx context.Context, model, prompt string, 
 	var total Usage
 	var lastText string
 	submitted := false
+	// Some endpoints ignore tool_choice:"required" and answer with plain text
+	// when they judge "no tool is needed" (observed on deepseek-v4-flash behind
+	// certain proxies). That reply must NOT be treated as task completion when
+	// nothing was submitted — otherwise the worker exits having done nothing.
+	// Re-prime the model with a hard tool-use instruction instead, up to a cap
+	// so a stubborn model cannot spin forever.
+	plainTextRetries := 0
+	const maxPlainTextRetries = 3
 
 	for step := 0; step < cfg.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -192,8 +200,22 @@ func (d *DirectHarness) RunAgentLoop(ctx context.Context, model, prompt string, 
 		})
 
 		if len(msg.ToolCalls) == 0 {
-			// Plain-text finish.
-			return AgentLoopResult{Reply: orNoReply(lastText), Usage: total, Steps: step + 1, Submitted: submitted}, nil
+			// Plain-text reply with no tool call.
+			if submitted {
+				// Work already handed to the integrator; a trailing plain-text
+				// wrap-up is a legitimate finish.
+				return AgentLoopResult{Reply: orNoReply(lastText), Usage: total, Steps: step + 1, Submitted: submitted}, nil
+			}
+			plainTextRetries++
+			if plainTextRetries > maxPlainTextRetries {
+				// Model keeps refusing tools; give up rather than burn tokens.
+				return AgentLoopResult{Reply: orNoReply(lastText), Usage: total, Steps: step + 1, Submitted: submitted}, nil
+			}
+			messages = append(messages, loopMessage{
+				Role:    "user",
+				Content: "You have not called any tool yet and nothing was submitted. Plain text does not complete the task. You MUST call a tool now: use bash/write to make progress, http to claim or submit work, or finish(summary) only when the work is actually done.",
+			})
+			continue
 		}
 
 		// Execute tool calls; finish short-circuits. Independent calls in the same
