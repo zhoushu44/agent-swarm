@@ -47,7 +47,7 @@ type runConfig struct {
 
 func defaultRunConfig() runConfig {
 	return runConfig{
-		maxWorkers:      8,
+		maxWorkers:      1000,
 		minWorkers:      1,
 		initialWorkers:  8,
 		maxTurns:        10,
