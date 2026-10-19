@@ -21,7 +21,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -233,6 +232,3 @@ func sentinelFor(status int) error {
 		return ErrBadRequest
 	}
 }
-
-// itoa is a tiny helper so query building stays readable.
-func itoa(n int) string { return strconv.Itoa(n) }

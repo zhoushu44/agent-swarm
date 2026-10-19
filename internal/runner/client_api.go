@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-\t"strconv"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"swarm-go/internal/protocol"
@@ -20,8 +21,8 @@ func (c *Client) Board(ctx context.Context, status string, limit, offset int) (*
 		offset = 0
 	}
 	q := url.Values{}
-	q.Set("limit", itoa(limit))
-	q.Set("offset", itoa(offset))
+	q.Set("limit", strconv.Itoa(limit))
+	q.Set("offset", strconv.Itoa(offset))
 	if s := strings.TrimSpace(status); s != "" {
 		q.Set("status", s)
 	}
@@ -38,7 +39,7 @@ func (c *Client) Board(ctx context.Context, status string, limit, offset int) (*
 // PendingBoard is the convenience form of Board used by the claim loop: the
 // first page of pending items.
 func (c *Client) PendingBoard(ctx context.Context) ([]*protocol.Item, error) {
-	page, err := c.Board(ctx, "pending", DefaultBoardLimit, 0)
+	page, err := c.Board(ctx, protocol.StatusPending, DefaultBoardLimit, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -102,8 +103,9 @@ func (c *Client) Claim(ctx context.Context, itemID, peer string) (*ClaimResult, 
 	if err := c.do(ctx, http.MethodPost, "/claim", nil, body, &res); err != nil {
 		return nil, err
 	}
-	if res.Token == "" {
-		return nil, fmt.Errorf("%w: claim returned an empty token", ErrUnavailable)
+	if strings.TrimSpace(res.Token) == "" {
+		return nil, &APIError{Method: http.MethodPost, Path: "/claim", StatusCode: http.StatusOK,
+			Err: fmt.Errorf("%w: claim returned an empty token", ErrUnavailable)}
 	}
 	if res.History == nil {
 		res.History = []*protocol.ContextEntry{}
@@ -114,8 +116,9 @@ func (c *Client) Claim(ctx context.Context, itemID, peer string) (*ClaimResult, 
 // Submit hands the finished work (identified by commitSha) to the integrator.
 func (c *Client) Submit(ctx context.Context, token, peer, commitSha string) (*protocol.Item, error) {
 	token = strings.TrimSpace(token)
+	peer = strings.TrimSpace(peer)
 	commitSha = strings.TrimSpace(commitSha)
-	if token == "" || strings.TrimSpace(peer) == "" || commitSha == "" {
+	if token == "" || peer == "" || commitSha == "" {
 		return nil, fmt.Errorf("%w: token, peer and commitSha are required", ErrBadRequest)
 	}
 	body := struct {
@@ -174,7 +177,7 @@ func (c *Client) AddContext(ctx context.Context, req protocol.AddContextRequest)
 	if strings.TrimSpace(req.Text) == "" {
 		return nil, fmt.Errorf("%w: text is required", ErrBadRequest)
 	}
-	if req.Kind == "" {
+	if strings.TrimSpace(req.Kind) == "" {
 		req.Kind = protocol.KindObserved
 	}
 	var entry protocol.ContextEntry
@@ -190,7 +193,7 @@ func (c *Client) SearchContext(ctx context.Context, query string, limit int) ([]
 	q := url.Values{}
 	q.Set("q", query)
 	if limit > 0 {
-		q.Set("limit", itoa(limit))
+		q.Set("limit", strconv.Itoa(limit))
 	}
 	var resp struct {
 		Entries []*protocol.ContextEntry `json:"entries"`
@@ -206,7 +209,8 @@ func (c *Client) SearchContext(ctx context.Context, query string, limit int) ([]
 
 // Message sends a peer-to-peer note.
 func (c *Client) Message(ctx context.Context, from, to, text string) (*protocol.Message, error) {
-	if strings.TrimSpace(to) == "" || strings.TrimSpace(text) == "" {
+	to = strings.TrimSpace(to)
+	if to == "" || strings.TrimSpace(text) == "" {
 		return nil, fmt.Errorf("%w: to and text are required", ErrBadRequest)
 	}
 	if strings.TrimSpace(from) == "" {
@@ -222,8 +226,12 @@ func (c *Client) Message(ctx context.Context, from, to, text string) (*protocol.
 
 // Messages lists notes addressed to peer received after since (unix millis).
 func (c *Client) Messages(ctx context.Context, peer string, since int64) ([]*protocol.Message, error) {
-	if strings.TrimSpace(peer) == "" {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
 		peer = c.peer
+	}
+	if peer == "" {
+		return nil, fmt.Errorf("%w: peer is required", ErrBadRequest)
 	}
 	q := url.Values{}
 	q.Set("peer", peer)
@@ -244,8 +252,12 @@ func (c *Client) Messages(ctx context.Context, peer string, since int64) ([]*pro
 // claims, new shared context and new messages since the given timestamp.
 // since = 0 returns everything.
 func (c *Client) Digest(ctx context.Context, peer string, since int64) (*protocol.Digest, error) {
-	if strings.TrimSpace(peer) == "" {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
 		peer = c.peer
+	}
+	if peer == "" {
+		return nil, fmt.Errorf("%w: peer is required", ErrBadRequest)
 	}
 	q := url.Values{}
 	q.Set("peer", peer)
