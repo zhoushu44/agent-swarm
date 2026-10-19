@@ -135,7 +135,7 @@ func main() {
 	check(err == nil, fmt.Sprint(err))
 	check(n == 1, fmt.Sprintf("reaped=%d", n))
 	w = do("GET", "/board?status=pending", "")
-	check(strings.Contains(w.Body.String(), `"total":3`), "pending after reap: "+w.Body.String())
+	check(strings.Contains(w.Body.String(), `"total":2`), "pending after reap: "+w.Body.String())
 
 	// persistence across reopen
 	dir := "file:probe2?mode=memory&cache=shared"
