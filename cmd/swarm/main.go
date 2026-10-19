@@ -130,6 +130,9 @@ func main() {
 				sw(&cfg.conventions)
 			case "--test-cmd":
 				sw(&cfg.testCmd)
+			case "--exit-when-done":
+				cfg.exitWhenDone = true
+				cfg.minWorkers = 0 // mirror JS: exit-when-done drops the idle-retire floor so the last worker can leave
 			}
 		}
 		if err := cmdRun(dir, cfg); err != nil {
@@ -189,9 +192,32 @@ func cmdInit(dir string) error {
 		return err
 	}
 	// create a git repository so worktree/merge operations work
-	cmd := exec.Command("git", "init")
-	cmd.Dir = dir
-	return cmd.Run()
+	init := exec.Command("git", "init")
+	init.Dir = dir
+	if err := init.Run(); err != nil {
+		return err
+	}
+	// HEAD must resolve before `git branch integration HEAD` and worktree add.
+	// On a fresh repo there is no commit yet; create an empty root commit.
+	head := exec.Command("git", "rev-parse", "--verify", "HEAD")
+	head.Dir = dir
+	if err := head.Run(); err != nil {
+		cfg := [][]string{
+			{"config", "user.email", "swarm@local"},
+			{"config", "user.name", "swarm"},
+		}
+		for _, args := range cfg {
+			c := exec.Command("git", args...)
+			c.Dir = dir
+			_ = c.Run()
+		}
+		commit := exec.Command("git", "commit", "--allow-empty", "-m", "swarm: init")
+		commit.Dir = dir
+		if out, err := commit.CombinedOutput(); err != nil {
+			return fmt.Errorf("git init commit: %v: %s", err, out)
+		}
+	}
+	return nil
 }
 
 func cmdSeed(dir, file string) error {

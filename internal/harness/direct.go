@@ -47,7 +47,13 @@ func (c DirectConfig) Normalize() DirectConfig {
 	}
 	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	if c.ChatPath == "" {
-		c.ChatPath = DefaultChatPath
+		// Mirror the JS harness: if the base already ends in /v1 the chat path
+		// must be /chat/completions, not /v1/chat/completions.
+		if strings.HasSuffix(c.BaseURL, "/v1") {
+			c.ChatPath = "/chat/completions"
+		} else {
+			c.ChatPath = DefaultChatPath
+		}
 	}
 	if !strings.HasPrefix(c.ChatPath, "/") {
 		c.ChatPath = "/" + c.ChatPath

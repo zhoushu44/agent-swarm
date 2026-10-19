@@ -96,7 +96,9 @@ func TestIDsAreUnique(t *testing.T) {
 
 	seen := map[string]bool{}
 	for i := 0; i < 20; i++ {
-		it, err := st.CreateItem(server.CreateItemInput{Peer: "w1", Title: "t"})
+		// Distinct titles: CreateItem dedups worker-created items by exact
+		// title, so identical titles would fold into one item by design.
+		it, err := st.CreateItem(server.CreateItemInput{Peer: "w1", Title: fmt.Sprintf("t%d", i)})
 		if err != nil {
 			t.Fatalf("CreateItem: %v", err)
 		}

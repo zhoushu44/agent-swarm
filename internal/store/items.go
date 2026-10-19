@@ -3,10 +3,40 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"regexp"
 	"strings"
 
 	"swarm-go/internal/server"
 )
+
+// artifactRE pulls file-path tokens (anything with an extension) out of an
+// item title. Mirrors the JS ARTIFACT_RE in store.js: two workers asked to
+// "add src/util/compact.js" and "create src/util/compact.js with tests" are
+// delivering the SAME artifact, but an exact-title dedup lets both through
+// and they collide on add/add at merge time. Folding by the extracted file
+// path collapses every phrasing of the same deliverable into one item.
+var artifactRE = regexp.MustCompile(`[A-Za-z0-9_@.\/\\-]+\.[A-Za-z][A-Za-z0-9]{0,5}\b`)
+
+// artifactKey returns the normalized dedup key for a title: "f:<path>" when
+// the title names at least one file (paths lowercased, backslashes → slashes,
+// leading ./ stripped, sorted+joined), else "" (caller falls back to exact
+// title match).
+func artifactKey(title string) string {
+	hits := artifactRE.FindAllString(title, -1)
+	if len(hits) == 0 {
+		return ""
+	}
+	seen := map[string]bool{}
+	var uniq []string
+	for _, h := range hits {
+		n := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(h, `\`, `/`), `./`))
+		if !seen[n] {
+			seen[n] = true
+			uniq = append(uniq, n)
+		}
+	}
+	return "f:" + strings.Join(uniq, "|")
+}
 
 // itemColumns is the canonical SELECT list for items, in the order scanItem
 // expects them.
@@ -146,6 +176,45 @@ func (s *Store) CreateItem(in server.CreateItemInput) (server.Item, error) {
 		}
 		if n == 0 {
 			return server.Item{}, notFound("create item parent", *parent)
+		}
+	}
+
+	// Dedup: worker-created items (CreateItem callers that pass a Peer are the
+	// HTTP /item path — LLM workers) fold into an existing OPEN item instead of
+	// adding a duplicate. Two levels, aligned with the JS dedupKey:
+	//   1. f: key — title names a file path → fold against ANY open item naming
+	//      the same path (catches "add X.js" vs "create X.js with tests").
+	//   2. exact title — fallback for titles with no file path.
+	// Seed callers (Peer="") bypass dedup so deliberate duplicate seeds work.
+	if strings.TrimSpace(in.Peer) != "" {
+		var dupID string
+		if key := artifactKey(title); key != "" {
+			// Global fold on the file key across all open items.
+			rows, derr := tx.Query(`SELECT id, title FROM items WHERE status NOT IN ('done','failed','split')`)
+			if derr != nil {
+				return server.Item{}, mapErr("create item dedup scan", derr)
+			}
+			for rows.Next() {
+				var id, t string
+				if serr := rows.Scan(&id, &t); serr != nil {
+					rows.Close()
+					return server.Item{}, mapErr("create item dedup scan", serr)
+				}
+				if artifactKey(t) == key {
+					dupID = id
+					break
+				}
+			}
+			rows.Close()
+		} else {
+			err = tx.QueryRow(`SELECT id FROM items WHERE title = ? AND status NOT IN ('done','failed','split') LIMIT 1`, title).Scan(&dupID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return server.Item{}, mapErr("create item dedup", err)
+			}
+		}
+		if dupID != "" {
+			_ = tx.Rollback()
+			return s.GetItem(dupID)
 		}
 	}
 

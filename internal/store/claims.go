@@ -33,16 +33,50 @@ func (s *Store) Claim(itemID, peer string) (server.ClaimResult, error) {
 		}
 		return server.ClaimResult{}, mapErr("claim item", err)
 	}
-	if it.Status != StatusPending {
+	// 只认 pending / in_progress：in_progress 放行进清理循环——过期租约会在
+	// 下面被回收并把 item 退回 pending，若在门口就拒掉，租约过期后没人能再
+	// claim，item 会永远卡在进行中（对齐 JS store.tryClaim 的语义）。
+	if it.Status != StatusPending && it.Status != StatusInProgress {
 		return server.ClaimResult{}, conflict("claim item", itemID, "is "+it.Status)
 	}
 
-	var existing int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM claims WHERE item_id = ?`, itemID).Scan(&existing); err != nil {
+	now := s.clock()
+	rows, err := tx.Query(`SELECT token, expires_at FROM claims WHERE item_id = ?`, itemID)
+	if err != nil {
 		return server.ClaimResult{}, mapErr("claim item", err)
 	}
-	if existing > 0 {
-		return server.ClaimResult{}, conflict("claim item", itemID, "already claimed")
+	type priorClaim struct {
+		token   string
+		expires int64
+	}
+	var priors []priorClaim
+	for rows.Next() {
+		var c priorClaim
+		if err := rows.Scan(&c.token, &c.expires); err != nil {
+			rows.Close()
+			return server.ClaimResult{}, mapErr("claim item", err)
+		}
+		priors = append(priors, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return server.ClaimResult{}, mapErr("claim item", err)
+	}
+	for _, c := range priors {
+		if c.expires > now {
+			return server.ClaimResult{}, conflict("claim item", itemID, "already claimed")
+		}
+		// 过期租约：回收；item 还停在 in_progress 则退回 pending，否则没人
+		// 再 claim 它会永远卡住。
+		if _, err := tx.Exec(`DELETE FROM claims WHERE token = ?`, c.token); err != nil {
+			return server.ClaimResult{}, mapErr("claim item", err)
+		}
+		if it.Status == StatusInProgress {
+			if _, err := tx.Exec(`UPDATE items SET status = ? WHERE id = ?`, StatusPending, itemID); err != nil {
+				return server.ClaimResult{}, mapErr("claim item", err)
+			}
+			it.Status = StatusPending
+		}
 	}
 
 	tokSeq, err := nextCounterTx(tx, "c")

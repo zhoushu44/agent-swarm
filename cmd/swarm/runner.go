@@ -43,6 +43,7 @@ type runConfig struct {
 	apiBase         string
 	apiKey          string
 	model           string
+	exitWhenDone    bool
 }
 
 func defaultRunConfig() runConfig {
@@ -66,12 +67,12 @@ func defaultRunConfig() runConfig {
 // swarmRunner is the Go port of the JS Runner. It owns the worker pool,
 // autoscaler, integrator, lease renewer and reaper.
 type swarmRunner struct {
-	cfg    runConfig
-	dir    string
-	repo   *gitutil.Repo
-	store  *store.Store
-	gate   *harness.AdaptiveSemaphore
-	guard  *sysload.Guard
+	cfg     runConfig
+	dir     string
+	repo    *gitutil.Repo
+	store   *store.Store
+	gate    *harness.AdaptiveSemaphore
+	guard   *sysload.Guard
 	harness harness.Harness
 
 	mu       sync.Mutex
@@ -83,26 +84,33 @@ type swarmRunner struct {
 
 	// token accounting
 	tokensSpent int64
-	budgetExceeded bool
+	// Cumulative token usage across ALL workers (current + retired). Done-line
+	// and budget accounting read these so retired workers' spend is not lost.
+	totalInputTokens  int64
+	totalOutputTokens int64
+	totalAPICalls     int64
+	budgetExceeded    bool
+
+	startMs time.Time
 }
 
 type workerState struct {
-	name      string
-	dir       string
-	branch    string
-	status    string // working / idle / retired / crashed
-	turn      int
-	idleCount int
-	syncSkew  int
-	redoCount int
-	lastReply string
-	lastDigestTs int64
-	itemHold  *itemHold
+	name              string
+	dir               string
+	branch            string
+	status            string // working / idle / retired / crashed
+	turn              int
+	idleCount         int
+	syncSkew          int
+	redoCount         int
+	lastReply         string
+	lastDigestTs      int64
+	itemHold          *itemHold
 	rateLimitedStreak int
-	loopDone  bool
-	reapFailCount int
-	reapFailAt    time.Time
-	tokenUsage workerUsage
+	loopDone          bool
+	reapFailCount     int
+	reapFailAt        time.Time
+	tokenUsage        workerUsage
 }
 
 type itemHold struct {
@@ -164,6 +172,7 @@ func newSwarmRunner(dir string, cfg runConfig, st *store.Store) (*swarmRunner, e
 // run starts the HTTP server, worker pool, autoscaler, integrator, renewer and
 // reaper, then blocks until SIGINT/SIGTERM or budget exhaustion.
 func (r *swarmRunner) run(ctx context.Context) error {
+	r.startMs = time.Now()
 	// 1. HTTP API server (workers use it for claim/submit/context).
 	srv := server.New(r.store)
 	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", r.cfg.serverPort), Handler: srv}
@@ -189,20 +198,61 @@ func (r *swarmRunner) run(ctx context.Context) error {
 	}
 
 	// 4. Background loops.
-	r.wg.Add(4)
+	r.wg.Add(5)
 	go r.autoscalerLoop(ctx)
 	go r.integratorLoop(ctx)
 	go r.renewerLoop(ctx)
 	go r.reaperLoop(ctx)
+	go r.progressLoop(ctx)
 
 	// 5. Wait for shutdown signal or budget stop.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case <-ctx.Done():
-	case <-sigCh:
-	case <-r.stopCh:
+
+	// exit-when-done: board clear + integration queue empty + no active workers.
+	var doneWatch <-chan time.Time
+	if r.cfg.exitWhenDone {
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		doneWatch = t.C
 	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			goto shutdown
+		case <-sigCh:
+			goto shutdown
+		case <-r.stopCh:
+			goto shutdown
+		case <-doneWatch:
+			open, _ := r.store.OpenCount()
+			queued := 0
+			if qs, err := r.store.QueuedSubmissions(); err == nil {
+				queued = len(qs)
+			}
+			r.mu.Lock()
+			active := 0
+			for _, w := range r.workers {
+				if w.status != "retired" && w.status != "crashed" {
+					active++
+				}
+			}
+			r.mu.Unlock()
+			if open == 0 && queued == 0 && active == 0 {
+				stats, _ := r.store.Stats()
+				r.mu.Lock()
+				in, out, apiCalls := r.totalInputTokens, r.totalOutputTokens, r.totalAPICalls
+				r.mu.Unlock()
+				wall := time.Since(r.startMs).Milliseconds()
+				fmt.Printf("[swarm] DONE: {\"done\":%d,\"total\":%d,\"failed\":%d,\"integrations\":%d,\"tokenUsage\":{\"apiCalls\":%d,\"inputTokens\":%d,\"outputTokens\":%d},\"wallTimeMs\":%d}\n",
+					stats.Done, stats.Total, stats.Failed, stats.Submitted, apiCalls, in, out, wall)
+				goto shutdown
+			}
+		}
+	}
+
+shutdown:
 
 	r.mu.Lock()
 	r.stopped = true
@@ -358,18 +408,19 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 
 		// Build prompt.
 		prompt := prompts.BuildWorkerPrompt(prompts.Options{
-			PeerName:   w.name,
-			ServerPort: r.cfg.serverPort,
-			Mission:    r.cfg.mission,
+			PeerName:    w.name,
+			ServerPort:  r.cfg.serverPort,
+			Mission:     r.cfg.mission,
 			Conventions: r.cfg.conventions,
-			Turn:       w.turn,
-			Brief:      brief,
-			Harness:    r.cfg.harnessName,
+			Turn:        w.turn,
+			Brief:       brief,
+			Harness:     r.cfg.harnessName,
 		})
 
 		// Run turn via harness (AIMD-gated).
 		var result harness.Response
 		var err error
+		loopSteps := 0
 		if r.cfg.harnessName == "echo" {
 			result, err = r.harness.Complete(ctx, harness.Request{
 				Messages: []harness.Message{{Role: harness.RoleUser, Content: prompt}},
@@ -377,20 +428,45 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 		} else {
 			err = r.gate.Do(ctx, func() error {
 				var e error
-				result, e = r.harness.Complete(ctx, harness.Request{
-					Model:    r.cfg.model,
-					Messages: []harness.Message{{Role: harness.RoleUser, Content: prompt}},
-				})
+				if dh, ok := r.harness.(*harness.DirectHarness); ok {
+					var lr harness.AgentLoopResult
+					lr, e = dh.RunAgentLoop(ctx, r.cfg.model, prompt, harness.AgentLoopConfig{
+						WorkDir:    w.dir,
+						ServerPort: r.cfg.serverPort,
+					})
+					result = harness.Response{Text: lr.Reply, Usage: lr.Usage}
+					loopSteps = lr.Steps
+				} else {
+					result, e = r.harness.Complete(ctx, harness.Request{
+						Model:    r.cfg.model,
+						Messages: []harness.Message{{Role: harness.RoleUser, Content: prompt}},
+					})
+					loopSteps = 1
+				}
 				return e
 			})
 			if err == nil {
 				r.gate.NoteOK()
 			} else {
 				var he *harness.HTTPError
-				if errors.As(err, &he) && he.StatusCode == 503 {
+				if errors.As(err, &he) && (he.StatusCode == 503 || he.StatusCode == 429) {
 					r.gate.NoteRateLimit()
 				}
 			}
+		}
+
+		// Token accounting.
+		if err == nil {
+			w.tokenUsage.apiCalls++
+			w.tokenUsage.inputTokens += result.Usage.PromptTokens
+			w.tokenUsage.outputTokens += result.Usage.CompletionTokens
+			w.tokenUsage.turns++
+			r.mu.Lock()
+			r.tokensSpent += int64(result.Usage.TotalTokens)
+			r.totalInputTokens += int64(result.Usage.PromptTokens)
+			r.totalOutputTokens += int64(result.Usage.CompletionTokens)
+			r.totalAPICalls += int64(loopSteps) // real HTTP rounds, not turns
+			r.mu.Unlock()
 		}
 
 		// Auto-commit any worktree changes.
@@ -398,6 +474,9 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 
 		// Track reply and idle.
 		reply := result.Text
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[swarm] %s turn %d harness err: %v\n", w.name, w.turn, err)
+		}
 		if len(reply) > 200 {
 			reply = reply[:200]
 		}
@@ -587,12 +666,12 @@ func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
 	_ = r.store.SetStatus(itemID, "split")
 	_, err1 := r.store.CreateItem(server.CreateItemInput{
 		Peer: "auto-split", Title: base + " — core implementation",
-		Detail: "Split from \"" + item.Title + "\" — core implementation only, no tests. " + item.Detail,
+		Detail:   "Split from \"" + item.Title + "\" — core implementation only, no tests. " + item.Detail,
 		ParentID: &itemID, Kind: "task",
 	})
 	_, err2 := r.store.CreateItem(server.CreateItemInput{
 		Peer: "auto-split", Title: base + " — tests",
-		Detail: "Split from \"" + item.Title + "\" — tests only, assumes core impl exists. " + item.Detail,
+		Detail:   "Split from \"" + item.Title + "\" — tests only, assumes core impl exists. " + item.Detail,
 		ParentID: &itemID, Kind: "task",
 	})
 	if err1 != nil || err2 != nil {
@@ -640,7 +719,7 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 			_ = r.store.ResolveSubmission(sub.ID, false, reason, r.cfg.maxItemFails)
 			_, _ = r.store.AddContext(server.ContextEntry{
 				Peer: sub.Peer, Kind: "FAIL",
-				Text: fmt.Sprintf("integration rejected for item %s (stage=stale): %s", sub.ItemID, reason),
+				Text:   fmt.Sprintf("integration rejected for item %s (stage=stale): %s", sub.ItemID, reason),
 				ItemID: &sub.ItemID, Tags: []string{"integration", "stale"},
 			})
 			return
@@ -657,7 +736,7 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 		_ = r.store.ResolveSubmission(sub.ID, false, reason, r.cfg.maxItemFails)
 		_, _ = r.store.AddContext(server.ContextEntry{
 			Peer: sub.Peer, Kind: "FAIL",
-			Text: fmt.Sprintf("integration failed for item %s: %s", sub.ItemID, reason),
+			Text:   fmt.Sprintf("integration failed for item %s: %s", sub.ItemID, reason),
 			ItemID: &sub.ItemID, Tags: []string{"integration", "failed"},
 		})
 		return
@@ -671,7 +750,7 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 			_ = r.store.ResolveSubmission(sub.ID, false, reason, r.cfg.maxItemFails)
 			_, _ = r.store.AddContext(server.ContextEntry{
 				Peer: sub.Peer, Kind: "FAIL",
-				Text: fmt.Sprintf("integration rejected for item %s (stage=no-op): %s", sub.ItemID, reason),
+				Text:   fmt.Sprintf("integration rejected for item %s (stage=no-op): %s", sub.ItemID, reason),
 				ItemID: &sub.ItemID, Tags: []string{"integration", "no-op"},
 			})
 			return
@@ -686,7 +765,7 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 		}
 		_, _ = r.store.AddContext(server.ContextEntry{
 			Peer: sub.Peer, Kind: "PATCH_SUMMARY",
-			Text: fmt.Sprintf("merged item %s into integration @%s:\n%s", sub.ItemID, res.SHA[:10], stat),
+			Text:   fmt.Sprintf("merged item %s into integration @%s:\n%s", sub.ItemID, res.SHA[:10], stat),
 			ItemID: &sub.ItemID, Tags: []string{"integration", "patch"},
 		})
 	}
@@ -777,6 +856,71 @@ func (r *swarmRunner) autoscalerLoop(ctx context.Context) {
 
 // ---------- lease renewer ----------
 
+// ---------- progress ----------
+
+// progressLoop prints a JS-style status line every 5s:
+// [MM:SS] pending=N inprog=M submtd=K done=D/T integ=I inflight=L w=[w1:working ...] | R tok/s
+func (r *swarmRunner) progressLoop(ctx context.Context) {
+	defer r.wg.Done()
+	if r.cfg.harnessName == "echo" {
+		return // offline: no rate signal, stay quiet
+	}
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	var lastTok int64
+	var lastTs time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.stopCh:
+			return
+		case now := <-t.C:
+			stats, err := r.store.Stats()
+			if err != nil {
+				continue
+			}
+			queued := 0
+			if qs, qerr := r.store.QueuedSubmissions(); qerr == nil {
+				queued = len(qs)
+			}
+			r.mu.Lock()
+			wparts := make([]string, 0, len(r.workers))
+			for _, w := range r.workers {
+				wparts = append(wparts, w.name+":"+w.status)
+			}
+			tok := r.tokensSpent
+			r.mu.Unlock()
+
+			rate := ""
+			if !lastTs.IsZero() {
+				dt := now.Sub(lastTs).Seconds()
+				if dt > 0 {
+					rate = fmt.Sprintf(" | %.0f tok/s", float64(tok-lastTok)/dt)
+				}
+			}
+			lastTok = tok
+			lastTs = now
+
+			elapsed := int(now.Sub(r.startMs).Seconds())
+			fmt.Printf("[%02d:%02d] pending=%d inprog=%d submtd=%d done=%d/%d integ=%d inflight=%d w=[%s]%s\n",
+				elapsed/60, elapsed%60,
+				stats.Pending, stats.InProgress, stats.Submitted, stats.Done, stats.Total,
+				queued, r.gate.Limit(), joinNonEmpty(wparts, " "), rate)
+		}
+	}
+}
+
+func joinNonEmpty(xs []string, sep string) string {
+	out := xs[:0]
+	for _, x := range xs {
+		if x != "" {
+			out = append(out, x)
+		}
+	}
+	return strings.Join(out, sep)
+}
+
 func (r *swarmRunner) renewerLoop(ctx context.Context) {
 	defer r.wg.Done()
 	interval := time.Duration(r.cfg.leaseSec/3) * time.Second
@@ -817,6 +961,10 @@ func (r *swarmRunner) reaperLoop(ctx context.Context) {
 			return
 		case <-time.After(10 * time.Second):
 		}
+		// Sweep expired leases periodically (JS does it inline in tryClaim; the
+		// Go store's Claim does that too, but only when someone attempts that
+		// exact item — the periodic sweep covers items nobody re-attempts).
+		_, _ = r.store.ReapExpired()
 		r.mu.Lock()
 		var toRemove []string
 		for name, w := range r.workers {
