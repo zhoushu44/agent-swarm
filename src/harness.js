@@ -21,13 +21,14 @@ const resolveMaxInflight = () => {
   return Number.isFinite(v) ? v : 64;
 };
 
-class Semaphore {
-  constructor(limit) { this.limit = limit; this.ceiling = limit; this.active = 0; this.queue = []; this._okStreak = 0; }
+export class Semaphore {
+  constructor(limit) { this.limit = limit; this.ceiling = limit; this.active = 0; this.queue = []; this._okStreak = 0; this._hiWater = 0; }
   async acquire() {
     if (this.limit <= 0) return; // 不限流
-    if (this.active < this.limit) { this.active += 1; return; }
+    if (this.active < this.limit) { this.active += 1; this._hiWater = Math.max(this._hiWater, this.active); return; }
     await new Promise((resolve) => this.queue.push(resolve));
     this.active += 1;
+    this._hiWater = Math.max(this._hiWater, this.active);
   }
   release() {
     if (this.limit <= 0) return;
@@ -37,7 +38,9 @@ class Semaphore {
   }
   setLimit(n) {
     this.limit = n;
-    if (n > this.ceiling) this.ceiling = n; // 显式调高上限时同步抬高天花板
+    // 显式调高上限（如 CLI setMaxInflight）才允许抬高天花板；AIMD 内部回退后的
+    // setLimit 不许把天花板顶回去——否则钉顶操作（noteRateLimit）立即被自己撤销。
+    if (n > this.ceiling && !this._aimdBacking) this.ceiling = n;
     // 放宽上限时唤醒等待者。注意：queue.shift()() 同步 resolve，但 acquire 内的
     // `await` 之后才会执行 this.active += 1——同步 while 读 this.active 是滞后值，
     // 会把整个队列一次性全唤醒造成超发。正确做法：先算名额，只唤醒那么多个。
@@ -47,15 +50,22 @@ class Semaphore {
     }
   }
   // 自适应并发（AIMD）：撞限流 → 上限乘性回退（0.75x）迅速卸压；连续成功 → 每 8 次
-  // 加性回升 1，缓慢逼近天花板。撞限流时把"当时实际达到的并发水平"记为新天花板——
+  // 加性回升 1，缓慢逼近天花板。撞限流时把"本轮实际达到的峰值并发"记为新天花板——
   // 服务端在哪个水位开始 503，那里就是它的真实容量；回退后反弹回旧天花板只会反复撞。
   // 而连续成功说明服务端还有余量：天花板每次 +1 缓慢上探，直到再次撞限收敛。
   noteRateLimit() {
     if (this.limit <= 0) return;
     this._okStreak = 0;
-    const hitLevel = Math.max(1, this.active);
-    if (hitLevel < this.ceiling) this.ceiling = hitLevel;
-    this.setLimit(Math.max(1, Math.floor(this.limit * 0.75)));
+    // 用峰值水位而非当前 active：真实路径先 release() 再 noteRateLimit()，
+    // 503 到达时部分并发早已释放，active 会系统性低估撞限水位。
+    const hitLevel = Math.max(1, this._hiWater || this.active);
+    if (hitLevel < this.ceiling) { this.ceiling = hitLevel; this._hiWater = 0; }
+    // 回退基数取 min(limit, ceiling)（即容量水位）：以 64 上限撞到容量 20 时，
+    // 退到 15（容量下 25% 卸压）而非 48（仍在容量之上继续压服务端）。
+    const backed = Math.max(1, Math.floor(Math.min(this.limit, this.ceiling) * 0.75));
+    this._aimdBacking = true;
+    this.setLimit(backed);
+    this._aimdBacking = false;
   }
   noteOk() {
     if (this.limit <= 0) return;
