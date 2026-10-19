@@ -2,6 +2,23 @@
 
 Go port of the [agent-swarm](../swarm) multi-agent parallel dev orchestrator. Workers claim items off a SQLite-backed board, drive an LLM through a 4-tool agent loop (bash / write / http / finish), and an integrator merges their worktrees.
 
+## Autoscaler: the worker pool is elastic, not fixed
+
+The single most important behavior for long-running jobs: **the worker count is not fixed at `--workers`**. An autoscaler loop (`autoscalerLoop`, 1s tick) continuously grows and shrinks the pool between `--workers` (floor) and `--max-workers` (ceiling, default 1000).
+
+Decision inputs each tick:
+
+- `open` = pending + in_progress items on the board
+- `recentSplit` = items split in the last 5 min (a burst of splits signals incoming sub-item load)
+- `demand = max(open, recentSplit)`, then `want = min(demand, open*2, maxWorkers)` — cap at 2× open items so we never spawn more workers than there is work to feed, and never exceed `--max-workers`
+- resource guard (`sysload`): if CPU or Mem > 92%, **shrink by 1**; if merely high pressure, **freeze** (no new spawns)
+
+Behavior:
+
+- **Scale up**: if `want > active`, spawn up to 64 workers per round until demand is met. A burst of auto-split sub-items or a large seed immediately pulls up w17, w18, … — you saw this in the "full-on" bench where splitting 4 big items spawned w17–w42.
+- **Scale down**: if `want < active`, retire **idle** workers only — a worker mid-task is never killed. Under `--exit-when-done` the floor (`minWorkers`) drops to 0 so the pool drains completely at the end.
+- **Net effect for a day-long run**: `seed 500 → initial --workers 16 → backlog builds → pool grows toward --max-workers → tail clears → workers retire → last few finish`. The ceiling is never the worker count; the real limiters are the LLM API's 429 capacity (governed by the AIMD gate) and the integrator's serial merge.
+
 ## Benchmark: Go v5.1.0 vs JS v3.1.0
 
 Real-token benchmark: 20 `util/*` tasks, deepseek-v4-flash, 8 workers, `--exit-when-done`. Both sides run the same mission constraint ("only the 20 seeded utils, no infrastructure items"). Metrics sampled from the real leaf process (`swarm.exe` / `node.exe`), not the `cmd.exe` wrapper.
