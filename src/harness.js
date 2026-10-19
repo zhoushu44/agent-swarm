@@ -38,8 +38,13 @@ class Semaphore {
   setLimit(n) {
     this.limit = n;
     if (n > this.ceiling) this.ceiling = n; // 显式调高上限时同步抬高天花板
-    // 放宽上限时把等待队列唤醒（多余的 resolve 会被 acquire 重新按新上限排队，不会超发）
-    if (n > 0) while (this.queue.length > 0 && this.active < this.limit) this.queue.shift()();
+    // 放宽上限时唤醒等待者。注意：queue.shift()() 同步 resolve，但 acquire 内的
+    // `await` 之后才会执行 this.active += 1——同步 while 读 this.active 是滞后值，
+    // 会把整个队列一次性全唤醒造成超发。正确做法：先算名额，只唤醒那么多个。
+    if (n > 0) {
+      let canWake = Math.max(0, this.limit - this.active);
+      while (canWake-- > 0 && this.queue.length > 0) this.queue.shift()();
+    }
   }
   // 自适应并发（AIMD）：撞限流 → 上限乘性回退（0.75x）迅速卸压；连续成功 → 每 8 次
   // 加性回升 1，缓慢逼近天花板。上限永不超过 ceiling（= 初始/显式设定值）。

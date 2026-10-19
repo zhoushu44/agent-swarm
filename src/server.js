@@ -18,8 +18,16 @@ export function createServer(store, { port = 17771, token = null, getStatus = nu
   };
   const readBody = (req) => new Promise((resolve) => {
     let data = '';
-    req.on('data', (c) => { data += c; if (data.length > 5e6) req.destroy(); });
-    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); } });
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    req.on('data', (c) => {
+      data += c;
+      // 超 5MB 直接拒收：destroy 会触发 close 而非 end，需主动 resolve 避免悬挂
+      if (data.length > 5e6) { try { req.destroy(); } catch {} finish({}); }
+    });
+    req.on('end', () => { try { finish(data ? JSON.parse(data) : {}); } catch { finish({}); } });
+    req.on('close', () => finish({}));
+    req.on('error', () => finish({}));
   });
 
   const server = http.createServer(async (req, res) => {

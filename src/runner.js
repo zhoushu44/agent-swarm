@@ -55,6 +55,11 @@ export class Runner {
     // 压测实证：w16 在 src/generator.js 上连跑 8 回合烧 78 万 tokens 仍不完工——
     // 超复杂单文件是单 worker 能力天花板，死磕不如放弃让别的 worker 重试。
     this.maxItemTurns = Number(this.maxItemTurns || 6);
+    // P0 动态负载均衡：慢任务检测阈值（毫秒）。持有同一 item 超过此时长且 token 速率
+    // 低于平均值一半 → 强制拆分，不等 6 回合。
+    this.slowItemMs = Number(this.slowItemMs || 300000); // 5 分钟
+    // P6 返工循环检测：worker 持续高 token 输出但长时间无集成 → 判定为返工循环。
+    this.reworkThresholdMs = Number(this.reworkThresholdMs || 600000); // 10 分钟
     // 任务发散护栏：auto-split 在总 item 数达到 maxItems 后停止拆解（仅熔断释放）。
     // 见 worker 循环里的 item_split_capped 事件。
     this.maxItems = Number(maxItems || 200);
@@ -310,6 +315,8 @@ export class Runner {
           this.log('worker.new_commit', { name: w.name, sha });
         }
         const idle = /(^|\W)IDLE(\W|$)/.test(result.reply || '');
+        // 记录 itemHold 开始时间（供 P0 慢任务检测）
+        if (!idle && w.itemHold) w.itemHold.since = w.itemHold.since || Date.now();
         if (idle) {
           w.idleCount += 1;
           w.status = 'idle';
@@ -336,7 +343,7 @@ export class Runner {
             for (const c of claims) {
               w.itemHold = w.itemHold || {};
               if (w.itemHold.itemId === c.item_id) w.itemHold.turns += 1;
-              else w.itemHold = { itemId: c.item_id, turns: 1 };
+              else w.itemHold = { itemId: c.item_id, turns: 1, since: Date.now() };
               // token 熔断：item 累计 input+output 超阈值 → 放弃
               const itemUsage = this.itemTokens.get(c.item_id);
               const itemTotal = itemUsage ? (itemUsage.inputTokens + itemUsage.outputTokens) : 0;
@@ -358,12 +365,19 @@ export class Runner {
                   if (total >= MAX_ITEMS || depth >= MAX_SPLIT_DEPTH) {
                     this.log('worker.item_split_capped', { name: w.name, itemId: c.item_id, total, depth, maxItems: MAX_ITEMS, maxDepth: MAX_SPLIT_DEPTH });
                   } else {
-                    const base = item.title.replace(/\.(js|ts|py|md)$/, '');
+                    // 去掉扩展名避免 dedupKey 把子项折叠回原项（f: 键相同）
+                    const base = item.title.replace(/\.(js|ts|py|md|go|rs|java|cpp|c|h|tsx|jsx)$/i, '');
                     try {
-                      this.store.addItem({ title: `${base} (core impl)`, detail: `Split from "${item.title}" — core implementation only, no tests. ${item.detail || ''}`, parentId: c.item_id, createdBy: 'auto-split' });
-                      this.store.addItem({ title: `${base} (tests)`, detail: `Split from "${item.title}" — tests only, assumes core impl exists. ${item.detail || ''}`, parentId: c.item_id, createdBy: 'auto-split' });
-                      this.log('worker.item_auto_split', { name: w.name, itemId: c.item_id, into: [`${base} (core impl)`, `${base} (tests)`] });
-                    } catch { /* addItem 失败不阻断 */ }
+                      // 先标记原 item 为 split，防止 addItem 时 dedupKey 命中原项
+                      this.store.db.prepare("UPDATE work_items SET status='split' WHERE id=?").run(c.item_id);
+                      this.store.addItem({ title: `${base} — core implementation`, detail: `Split from "${item.title}" — core implementation only, no tests. ${item.detail || ''}`, parentId: c.item_id, createdBy: 'auto-split' });
+                      this.store.addItem({ title: `${base} — tests`, detail: `Split from "${item.title}" — tests only, assumes core impl exists. ${item.detail || ''}`, parentId: c.item_id, createdBy: 'auto-split' });
+                      this.log('worker.item_auto_split', { name: w.name, itemId: c.item_id, into: [`${base} — core implementation`, `${base} — tests`] });
+                    } catch (e) {
+                      // addItem 失败时回滚状态，让 worker 重试或继续
+                      this.store.db.prepare("UPDATE work_items SET status='pending' WHERE id=?").run(c.item_id);
+                      this.log('worker.item_auto_split_failed', { name: w.name, itemId: c.item_id, error: e.message });
+                    }
                   }
                 }
                 this.store.release(c.token);
@@ -705,6 +719,9 @@ export class Runner {
     if (r.ok) {
       this.store.recordIntegration(s.peer, s.item_id, r.sha, this.testCmd || '', true, true);
       this.store.resolveSubmission(s.id, true, null); // 门禁过 → item done
+      // P6：记录 worker 最后集成时间（供返工循环检测）
+      const w = this.workers.get(s.peer);
+      if (w) w.lastIntegrationTs = Date.now();
       // m5'：广播改动摘要。Agensh 的 PATCH_SUMMARY 机制——其他 worker 从简报/搜索里
       // 直接看到"集成分支上多了什么"，不必自行 diff 也能避开别人刚动过的文件。
       // diffStat 已按 1200 字符截断：够看清动了哪些文件，又不至于刷屏 context 表。
@@ -806,7 +823,119 @@ export class Runner {
           if (w.status === 'idle') { w.status = 'retired'; active -= 1; }
         }
       }
+      // P0 动态负载均衡：检测慢任务并强制拆分
+      await this._detectAndSplitSlowItems();
+      // P6 返工循环检测：高 token 输出但无集成的 worker 强制提交
+      await this._detectReworkLoops();
     }
+  }
+
+  // P0 动态负载均衡：检测持有同一 item 超过 slowItemMs 且 token 速率低的 worker，强制拆分
+  async _detectAndSplitSlowItems() {
+    // echo harness 是离线测试，不走真实 LLM 速率分析，跳过检测
+    if (this.harnessName === 'echo') return;
+    try {
+      const now = Date.now();
+      const avgRate = this._avgTokenRate();
+      for (const w of this.workers.values()) {
+        if (w.status !== 'working' || !w.itemHold) continue;
+        const holdMs = now - (w.itemHold.since || 0);
+        if (holdMs < this.slowItemMs) continue;
+        // 计算该 worker 在此 item 上的 token 速率
+        const itemUsage = this.itemTokens.get(w.itemHold.itemId);
+        const itemTokens = itemUsage ? (itemUsage.inputTokens + itemUsage.outputTokens) : 0;
+        const rate = itemTokens / (holdMs / 1000); // tokens per second
+        // 绝对兜底：持有超过 10 分钟即拆，不看相对速率（防全员高速时无人触发）
+        const isSlow = holdMs > 600000 || rate < avgRate * 0.5;
+        if (isSlow) {
+          this.log('worker.slow_item_detected', { name: w.name, itemId: w.itemHold.itemId, holdMs, rate, avgRate });
+          // 强制拆分：复用现有的 auto-split 逻辑
+          const claims = this.store.activeClaimsByPeer(w.name);
+          for (const c of claims) {
+            if (c.item_id !== w.itemHold.itemId) continue;
+            const item = this.store.item(c.item_id);
+            if (!item) continue;
+            const MAX_ITEMS = Number(this.maxItems || 200);
+            const MAX_SPLIT_DEPTH = 4;
+            const total = this.store.itemCount();
+            const depth = this.store.itemDepth(c.item_id);
+            if (total < MAX_ITEMS && depth < MAX_SPLIT_DEPTH) {
+              // 去掉扩展名避免 dedupKey 折叠（f: 键相同会导致子项被吞）
+              const base = item.title.replace(/\.(js|ts|py|md|go|rs|java|cpp|c|h|tsx|jsx)$/i, '');
+              try {
+                // 先标记原 item 为 split，防止 addItem 时 dedupKey 命中原项
+                this.store.db.prepare("UPDATE work_items SET status='split' WHERE id=?").run(c.item_id);
+                this.store.addItem({ title: `${base} — part A`, detail: `Split from "${item.title}" — slow task auto-split part A. ${item.detail || ''}`, parentId: c.item_id, createdBy: 'auto-split-slow' });
+                this.store.addItem({ title: `${base} — part B`, detail: `Split from "${item.title}" — slow task auto-split part B. ${item.detail || ''}`, parentId: c.item_id, createdBy: 'auto-split-slow' });
+                this.log('worker.slow_item_split', { name: w.name, itemId: c.item_id, into: [`${base} — part A`, `${base} — part B`] });
+              } catch (e) {
+                // addItem 失败时回滚状态，让 worker 重试或继续
+                this.store.db.prepare("UPDATE work_items SET status='pending' WHERE id=?").run(c.item_id);
+                this.log('worker.slow_item_split_failed', { name: w.name, itemId: c.item_id, error: e.message });
+              }
+            }
+            this.store.release(c.token);
+            w.itemHold = null;
+            break;
+          }
+        }
+      }
+    } catch { /* store 已关闭 */ }
+  }
+
+  // P6 返工循环检测：worker 持续高 token 输出但长时间无集成 → 强制提交当前进度
+  async _detectReworkLoops() {
+    // echo harness 是离线测试，不走真实集成，跳过检测
+    if (this.harnessName === 'echo') return;
+    try {
+      const now = Date.now();
+      // 冷却：同一 worker 命中后 60s 内不再重报/重提交。
+      // 没有它 autoscaler 每秒一轮会把同一 worker 刷出几百条事件 + 每秒 git add/commit 抖动。
+      this._reworkCooldown = this._reworkCooldown || new Map(); // name → ts
+      for (const w of this.workers.values()) {
+        if (w.status !== 'working') continue;
+        const lastFired = this._reworkCooldown.get(w.name) || 0;
+        if (now - lastFired < 60000) continue;
+        // 距上次集成的时长：从未集成过的 worker 从启动时刻起算
+        const lastIntegration = now - (w.lastIntegrationTs || this._startedAt);
+        if (lastIntegration < this.reworkThresholdMs) continue;
+        // 检查该 worker 的 token 输出
+        const usage = w.tokenUsage;
+        if (!usage || usage.outputTokens < 50000) continue; // 至少 5 万 output tokens
+        // 高输出 + 长时间无集成 = 返工循环
+        this.log('worker.rework_loop_detected', { name: w.name, outputTokens: usage.outputTokens, lastIntegrationMs: lastIntegration });
+        // 强制提交：触发一次 _autoCommit（不等待回合结束）
+        // 注意：_autoCommit 只是本地 commit，不等于集成成功——不重置 lastIntegrationTs，
+        // 让 integrator 真正落地时（_integrateOne 成功路径）再重置。否则会掩盖真实返工。
+        const sha = await this._autoCommit(w);
+        if (sha) {
+          this.log('worker.rework_forced_commit', { name: w.name, sha });
+          // 自动 submit：worker 已陷返工循环，多半不会主动 finish/submit。
+          // 把当前进度推到集成队列让门禁裁决——过则落地，不过则打回 pending 让别人重试，
+          // 都比无限 rework 强。无 active claim 时 submitWork 返回 null，无害。
+          try {
+            const claims = this.store.activeClaimsByPeer(w.name);
+            for (const c of claims) {
+              const r = this.store.submitWork(c.token, w.name, sha);
+              if (r) {
+                this.log('worker.rework_auto_submitted', { name: w.name, itemId: r.itemId, submissionId: r.submissionId });
+                w.itemHold = null;
+              }
+            }
+          } catch { /* store 已关闭 */ }
+        }
+        // 无论本次是否真的产生新提交，都记冷却——防止"worker 在写文件 → status 为空 →
+        // 下一秒又命中"的刷屏循环。冷却到点再检测，给 integrator 60s 落地窗口。
+        this._reworkCooldown.set(w.name, now);
+      }
+    } catch { /* store 已关闭 */ }
+  }
+
+  // 计算全局平均 token 速率（output tokens / 秒）
+  _avgTokenRate() {
+    const elapsed = (Date.now() - this._startedAt) / 1000;
+    if (elapsed <= 0) return 1000; // 默认 1000 tok/s
+    return (this.tokenUsage.outputTokens || 0) / elapsed;
   }
 
   // ---------- reaper（独立循环）：回收退场 worker 的 worktree，防止长跑磁盘泄漏 ----------

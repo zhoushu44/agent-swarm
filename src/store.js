@@ -82,7 +82,7 @@ export class Store {
       childCount: this.db.prepare('SELECT COUNT(*) AS n FROM work_items WHERE parent_id = ?'),
       // 拆解幂等用：同一父项下按归一化 key 查已存在的子项（精确 title 挡不住 LLM 标题变体）
       // 用 `IS` 而非 `=`：根级项 parent_id 为 NULL，`= NULL` 永不命中 → 顶层项完全不去重。
-      findChildByKey: this.db.prepare(`SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE parent_id IS ? AND dedup_key = ? LIMIT 1`),
+      findChildByKey: this.db.prepare(`SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE parent_id IS ? AND dedup_key = ? AND status != 'split' LIMIT 1`),
       // 语义折叠候选：同一父项下所有未完成的"无文件名"项（t: 键）。
       // 排除 done/failed：把新任务折进已完成项等于静默丢活；折进 failed 项等于
       // 把活扔进熔断坑（永不再被认领）。宁可多建一项也不能吞掉真活。
@@ -98,7 +98,7 @@ export class Store {
       // failed 的也不折叠——熔断后允许用新 item 重新开同一交付物（新尝试、新计数）。
       // 优先返回 pending（可立即认领），避免把 submitted（门禁中，认领必 409）排在前面。
       findOpenByKeyGlobal: this.db.prepare(
-        `SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE dedup_key = ? AND status NOT IN ('done','failed')
+        `SELECT ${WORK_ITEM_FIELDS} FROM work_items WHERE dedup_key = ? AND status NOT IN ('done','failed','split')
          ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at ASC LIMIT 1`
       ),
       listItems: this.db.prepare(`SELECT ${WORK_ITEM_FIELDS} FROM work_items ORDER BY priority DESC, created_at ASC`),
@@ -688,6 +688,7 @@ export class Store {
   // 父项级联：所有子项达终态（done 或 failed）时父项也达终态——
   // 全 done → done（正常收敛）；含 failed → failed（如实反映有损失，不装作完成）。
   // 不达终态则父项保持原状继续等。这是"含失败子项的父项永远等不齐"的防护。
+  // split 状态的父项视为等待子项的容器，子项全 settled 时同样收敛。
   _cascadeParent(item, peer, status) {
     if (!item.parent_id) return;
     const siblings = this.db.prepare('SELECT status FROM work_items WHERE parent_id = ?').all(item.parent_id);
@@ -700,6 +701,8 @@ export class Store {
     if (!parent || parent.status === parentStatus) return;
     this._setStatus(item.parent_id, parentStatus);
     this.log(peer, allDone ? 'item.done.auto' : 'item.failed.auto', { itemId: item.parent_id, via: status });
+    // 递归向上：父项状态改变后，可能影响祖父项
+    this._cascadeParent(parent, peer, status);
   }
 
   // 预算熔断收尾（f5）：把所有开放项（pending/in_progress/submitted）标 failed。

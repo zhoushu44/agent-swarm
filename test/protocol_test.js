@@ -729,8 +729,14 @@ async function scenarioSyncSkew() {
   await waitFor(() => store.item('t2').status === 'done', { label: 'loser item done after absorb', timeoutMs: 60000 });
   check('P5 吸收：吸收后输家完成自己的 item', store.item('t2').status === 'done',
     JSON.stringify({ t1: store.item('t1').status, t2: store.item('t2').status }));
-  check('P5 吸收：输家未退场', runner.workers.get(loserName)?.status !== 'retired',
-    String(runner.workers.get(loserName)?.status));
+  // 吸收 ≠ 因冲突退场：t2 done 之后 board 空了，maxTurns/idle 软上限合法退休不算输。
+  // 真正的失败信号是 retired_skew / retired_redo_exhausted / retired_reset_failed ——
+  // 那三种说明 P5 吸收机制没救回这个 worker。
+  const loserRetireEvs = store.eventsAfter(0, 2000)
+    .filter((e) => e.type.startsWith('worker.retired') && e.payload.name === loserName)
+    .map((e) => e.type);
+  const badRetire = loserRetireEvs.find((t) => /_skew|_redo_exhausted|_reset_failed/.test(t));
+  check('P5 吸收：输家未因冲突退场', !badRetire, JSON.stringify(loserRetireEvs));
 
   await runner.stop(); server.close(); store.close();
   fs.rmSync(repoDir, { recursive: true, force: true });

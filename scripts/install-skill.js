@@ -34,10 +34,11 @@ function getClaudeSkillsDir() {
   return path.join(home, '.config', 'claude-code', 'skills');
 }
 
-// 2. 检查 swarm 依赖
-function checkDependencies() {
-  const nm = path.join(SWARM_ROOT, 'node_modules', 'better-sqlite3');
-  return fs.existsSync(nm);
+// 2. 检查 Node 版本（v2.0 起已弃用 better-sqlite3，全部改用内置模块
+//    node:sqlite / node:http / node:child_process，无第三方依赖；node:sqlite 需要 Node >= 22.5）
+function checkNodeVersion() {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  return major > 22 || (major === 22 && minor >= 5);
 }
 
 // 3. 检查 API 配置
@@ -284,18 +285,12 @@ async function main() {
     process.exit(1);
   }
 
-  // 2. 检查依赖
-  const depsOk = checkDependencies();
-  log(`  ${checkmark(depsOk)} node_modules/better-sqlite3`, depsOk ? 'green' : 'yellow');
-  if (!depsOk) {
-    log('\n依赖未安装，正在执行 npm install...', 'yellow');
-    try {
-      execSync('npm install', { cwd: SWARM_ROOT, stdio: 'inherit' });
-      log('✓ 依赖安装完成', 'green');
-    } catch (e) {
-      log(`✗ npm install 失败: ${e.message}`, 'red');
-      process.exit(1);
-    }
+  // 2. 检查 Node 版本（已弃用 better-sqlite3，node:sqlite 内置，无需 npm install）
+  const nodeOk = checkNodeVersion();
+  log(`  ${checkmark(nodeOk)} Node.js ${process.versions.node}（node:sqlite 内置可用，需 >= 22.5）`, nodeOk ? 'green' : 'red');
+  if (!nodeOk) {
+    log('\n错误：Node.js 版本太旧，node:sqlite 需要 Node >= 22.5，请升级 Node.js', 'red');
+    process.exit(1);
   }
 
   // 3. 检查 API 配置

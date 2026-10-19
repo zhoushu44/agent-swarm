@@ -369,8 +369,19 @@ export class Repo {
     let beforeSha;
     try {
       // 回滚点：优先用内存镜像（单进程里只有集成器推进集成分支），省掉一次 `rev-parse HEAD`
-      // 子进程往返。首次（镜像为空）或镜像与集成分支失联时，才真的读一次。
-      beforeSha = this.integrationHead || (this.integrationHead = await gitAsync(['rev-parse', 'HEAD'], itDir));
+      // 子进程往返。首次（镜像为空）或镜像与集成分支失联（外部 reset/rebase 过）时，
+      // 重新读一次。失联检测：镜像必须仍是当前 HEAD 的祖先（或相等）。
+      beforeSha = this.integrationHead;
+      if (beforeSha) {
+        const cur = await gitOkAsync(['rev-parse', 'HEAD'], itDir);
+        // 镜像与 HEAD 不一致且镜像不是 HEAD 的祖先 → 分支被外力拉回，镜像失效
+        if (cur && cur !== beforeSha) {
+          const anc = await isAncestor(beforeSha, 'HEAD', itDir);
+          if (!anc) beforeSha = null;
+        }
+      }
+      if (!beforeSha) beforeSha = await gitAsync(['rev-parse', 'HEAD'], itDir);
+      this.integrationHead = beforeSha;
       // 合并前清场：集成 worktree 是 swarm 自有的，但 testCmd（pytest 等）会在里面生成
       // __pycache__/*.pyc 等副产物。一旦这些文件在上次 merge 时被带进树（tracked），
       // 本次 merge 就会报 "Your local changes would be overwritten"（真实事故：5 次
@@ -596,7 +607,6 @@ Output the COMPLETE merged file content (no markdown fence, no explanation). Pre
             const tmpCheck = path.join(tmpDir, 'check.js');
             fs.writeFileSync(tmpCheck, content);
             try {
-              await gitOkAsync(['--version'], itDir); // 确保 git 可用（占位）
               const { execSync } = await import('node:child_process');
               execSync(`node --check "${tmpCheck}"`, { stdio: 'pipe' });
             } catch (e) {
@@ -637,7 +647,17 @@ Output the COMPLETE merged file content (no markdown fence, no explanation). Pre
     const msg = `${message || `swarm batch-integrate ${entries.length} branches`}\n\n${trailer}`;
     let beforeSha;
     try {
-      beforeSha = this.integrationHead || (this.integrationHead = await gitAsync(['rev-parse', 'HEAD'], itDir));
+      // 同 integrate()：失联检测——镜像必须仍是 HEAD 的祖先，否则重新读
+      beforeSha = this.integrationHead;
+      if (beforeSha) {
+        const cur = await gitOkAsync(['rev-parse', 'HEAD'], itDir);
+        if (cur && cur !== beforeSha) {
+          const anc = await isAncestor(beforeSha, 'HEAD', itDir);
+          if (!anc) beforeSha = null;
+        }
+      }
+      if (!beforeSha) beforeSha = await gitAsync(['rev-parse', 'HEAD'], itDir);
+      this.integrationHead = beforeSha;
       // 同 integrate()：合并前清场，防 testCmd 副产物（.pyc 等）撞 "local changes would be overwritten"。
       await gitAsync(['reset', '--hard', 'HEAD'], itDir);
       await gitAsync(['clean', '-fd'], itDir);
