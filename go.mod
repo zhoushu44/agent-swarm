@@ -2,7 +2,10 @@ module swarm-go
 
 go 1.22
 
-require modernc.org/sqlite v1.34.5
+require (
+	github.com/mattn/go-sqlite3 v1.14.22
+	modernc.org/sqlite v1.34.5
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
