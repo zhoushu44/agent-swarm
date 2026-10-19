@@ -17,7 +17,6 @@ import { Runner } from './src/runner.js';
 import { Repo, gitOkAsync } from './src/gitutil.js';
 import { setMaxInflight, apiInflight, planMission, createDedupJudge } from './src/harness.js';
 import { validateRules } from './src/prompts.js';
-import { machineCeiling } from './src/sysload.js';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -96,13 +95,11 @@ async function main() {
     const model = flag('model') || fromKv('model') || undefined;
     // --workers 只作为上限别名（max），下限默认 1：autoscaler 按真实任务量伸缩。
     // 若把 --workers 也当下限，会出现"20 个任务强拉 200 worker"的空转（idle_skip 爆炸）。
-    // 缺省值按机器自适应（CPU 核数的一半，下限 2）：不再无脑默认 8——4 核小机器
-    // 默认 8 必然卡死（真实事故）。显式传 --max-workers 时尊重用户值，但运行时
-    // 资源护栏（resourceGuard）仍会在系统超载时动态钳制，--no-resource-guard 关闭。
-    // --max-workers 0 表示"无静态上限"：worker 数完全由任务量 + 运行时资源护栏
-    // （CPU>80% 停扩、CPU>92% 主动缩、可用内存<15% 停扩、<8% 主动缩）动态决定。
-    const machineDefault = machineCeiling(os.cpus().length);
-    const maxWorkersRaw = flag('max-workers') ?? flag('workers') ?? fromKv('maxWorkers') ?? machineDefault;
+    // 缺省固定 8：CPU 核数自适应（核数一半下限 2）对小机器太保守——用户主力机器
+    // 核数多但任务量大，按核数砍半反而限制并行度。小机器超载由运行时资源护栏
+    // （resourceGuard：CPU>80% 停扩、>92% 主动缩、内存<15% 停扩、<8% 主动缩）兜底。
+    // --max-workers 0 表示"无静态上限"：worker 数完全由任务量 + 运行时资源护栏动态决定。
+    const maxWorkersRaw = flag('max-workers') ?? flag('workers') ?? fromKv('maxWorkers') ?? 8;
     const maxWorkers = Number(maxWorkersRaw); // 0 = 不设上限（交给资源护栏）
     const minWorkers = Number(flag('min-workers') || fromKv('minWorkers') || 1);
     const resourceGuard = !flag('no-resource-guard');
@@ -225,10 +222,12 @@ async function main() {
     runner.startLeaseRenewer();
     runner.startAutoscaler();
     runner.startReaper();
-    // 初始拉起 minWorkers（自动退出模式下仍拉 max(1, minWorkers) 个起活）
-    for (let i = 0; i < Math.max(1, minWorkers); i++) await runner.spawnWorker(`w${i + 1}`);
+    // 初始拉起：直接铺到 min(8, maxWorkers)（无上限模式按 8），autoscaler 再按任务量增减。
+    // 旧"只拉 minWorkers=1 再慢慢扩"在大任务量下起步太慢；8 是任务量驱动的合理起步值。
+    const initialWorkers = Math.max(1, Math.min(maxWorkers > 0 ? maxWorkers : 8, 8));
+    for (let i = 0; i < initialWorkers; i++) await runner.spawnWorker(`w${i + 1}`);
     const startMs = Date.now();
-    console.log(`swarm running: harness=${harness} workers=${minWorkers}..${maxWorkers} inflight<=${apiInflight().limit} api=http://127.0.0.1:${port}${exitWhenDone ? ' exit-when-done' : ''}${resourceGuard ? ' resource-guard=on' : ' resource-guard=OFF'}`);
+    console.log(`swarm running: harness=${harness} workers=${initialWorkers}..${maxWorkers > 0 ? maxWorkers : '∞'} inflight<=${apiInflight().limit} api=http://127.0.0.1:${port}${exitWhenDone ? ' exit-when-done' : ''}${resourceGuard ? ' resource-guard=on' : ' resource-guard=OFF'}`);
     console.log('press Ctrl+C to stop');
     // 实时运行窗口：5s 一刷，带 tokens/s 差分速度（真实调用才有速度，echo 离线为 0）。
     let lastTk = null; let lastTs = Date.now(); let elapsed = 0;

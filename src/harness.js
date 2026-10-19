@@ -47,15 +47,20 @@ class Semaphore {
     }
   }
   // 自适应并发（AIMD）：撞限流 → 上限乘性回退（0.75x）迅速卸压；连续成功 → 每 8 次
-  // 加性回升 1，缓慢逼近天花板。上限永不超过 ceiling（= 初始/显式设定值）。
-  // 目的：worker 数远超中转站真实并发时，靠反馈自动收敛，而不是固定 64 硬扛或超发。
+  // 加性回升 1，缓慢逼近天花板。撞限流时把"当时实际达到的并发水平"记为新天花板——
+  // 服务端在哪个水位开始 503，那里就是它的真实容量；回退后反弹回旧天花板只会反复撞。
+  // 而连续成功说明服务端还有余量：天花板每次 +1 缓慢上探，直到再次撞限收敛。
   noteRateLimit() {
     if (this.limit <= 0) return;
     this._okStreak = 0;
+    const hitLevel = Math.max(1, this.active);
+    if (hitLevel < this.ceiling) this.ceiling = hitLevel;
     this.setLimit(Math.max(1, Math.floor(this.limit * 0.75)));
   }
   noteOk() {
-    if (this.limit <= 0 || this.limit >= this.ceiling) return;
+    if (this.limit <= 0) return;
+    // 成功且已顶到当前上限 → 服务端还有余量，天花板 +1 上探（动态扩容）
+    if (this.limit >= this.ceiling) { this.ceiling = this.limit + 1; }
     this._okStreak += 1;
     if (this._okStreak >= 8) { this._okStreak = 0; this.setLimit(this.limit + 1); }
   }
