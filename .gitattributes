@@ -1,0 +1,5 @@
+# Golden prompt fixtures are compared BYTE-FOR-BYTE by
+# internal/prompts/golden_test.go. Keep them LF on every platform: this repo
+# runs with core.autocrlf=true on Windows, which would otherwise check them out
+# as CRLF and fail the test for every worker.
+internal/prompts/testdata/*.golden text eol=lf
