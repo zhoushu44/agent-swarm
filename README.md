@@ -5,44 +5,61 @@ Go port of the [agent-swarm](../swarm) multi-agent parallel dev orchestrator. Wo
 ## Quick start
 
 ```bash
-swarm seed <dir> --file seed.json     # seed work items
-swarm run  <dir>                      # just run it — the guards below are ON by default
+swarm seed <dir> --file seed.json     # what you want done — intent is enough
+swarm run  <dir>                      # that's it
 swarm status <dir>                    # board + "seed work: N/M terminal"
 swarm log   <dir>                     # what happened, as structured events
 ```
 
-### Defaults that are already ON
+No time limits, no worker counts, no file lists. You describe the work; the
+swarm decides how to cut it up and how long to run.
 
-These ship enabled because a run without them is unpredictable. Each one was
-added after a real run demonstrated the failure.
+### What you write, and what it does with it
 
-| Default | Value | Why |
-|---|---|---|
-| `--exit-when-done` | on | "Done" = **the items you seeded** reached a terminal state. Not "board empty" — workers keep inventing useful work, so an empty board never happens. |
-| `--max-wall-clock` | 30m | Hard ceiling for the whole run. Every other breaker is per-turn or per-output, so a worker that makes a tiny diff every turn never trips any of them (measured: one worker held an item 12 min while the rest finished in 5). |
-| `--max-item-seconds` | 300 | A worker holding one item longer than this releases it back to the pool, with a FAIL note so the next worker does not repeat the dead end. |
-
-Override or disable explicitly:
-
-```bash
-swarm run <dir> --max-wall-clock 2h     # longer ceiling
-swarm run <dir> --max-wall-clock 0      # no ceiling (not recommended)
-swarm run <dir> --no-exit-when-done     # wait for a completely empty board
-swarm run <dir> --max-item-seconds 900  # give stuck items more room
+```json
+[
+  { "title": "让 app 正确处理错误", "detail": "到处都在吞错误。修好。" }
+]
 ```
+
+That item names no files and no symbols. What happens:
+
+1. **Presplit** — if the detail *does* mention real files, the item is split
+   into one child per file before any worker starts. Zero cost.
+2. **First-turn split** — if it does not, the first worker to claim it gets
+   `needsSplit: true`, reads the code to find what is involved, creates one
+   child per file, and takes one of them. The rest run in parallel.
+3. **Symbol-level dedup** — two items naming different functions of the same
+   file do not conflict and are not folded into one.
+
+So a 30-minute job becomes several parallel 5-minute jobs without you writing
+a spec.
+
+### How the run knows when to stop
+
+There is no wall clock to set. The ceiling is a **silence timeout**:
+
+- progress (a merge, a submission, an item reaching a terminal state) resets the timer
+- `--idle-stop` (default **10 min**) with no progress ends the run, with a full report
+- `--exit-when-done` (default on) exits as soon as **the items you seeded** are terminal — workers keep inventing useful bonus work, and that no longer holds the door open
+- a generous hard ceiling (`--max-wall-clock`, default 6h) remains only as a backstop for pathological cases
+
+Net effect: small jobs leave in minutes, big jobs run as long as they keep
+moving, dead ones stop within ten minutes.
 
 ### Interrupting and resuming
 
-Stopping a run (Ctrl-C, wall-clock, or seed-done) loses nothing:
+Stopping a run (Ctrl-C, silence timeout, or seed-done) loses nothing:
 
 - finished items are **not re-claimable** — a second run with the same seed does
   not redo them
 - open items resume where they were
 - everything that passed the gate stays on the `integration` branch
 
-So a 50-minute job split across three runs costs three runs' worth of work,
-not 3× the work. The end-of-run report says exactly which items are in which
-state, and `swarm log <dir>` gives the per-event trail.
+The end-of-run report says exactly which items are in which state, split into
+**SEED WORK** (what you asked for) and **BONUS WORK** (what the swarm found on
+its own), plus what is still open and what each item cost in tokens.
+`swarm log <dir>` gives the per-event trail.
 
 ## Autoscaler: the worker pool is elastic, not fixed
 
