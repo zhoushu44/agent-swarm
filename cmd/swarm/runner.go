@@ -310,6 +310,13 @@ func (r *swarmRunner) run(ctx context.Context) error {
 		return fmt.Errorf("ensure integration branch: %w", err)
 	}
 
+	// 2c. Pre-split oversized seed items so the board starts parallel. A
+	//     30-minute job becomes 6 five-minute jobs before any worker starts,
+	//     instead of one worker discovering the size the hard way.
+	if n := r.presplitOversizedItems(r.dir); n > 0 {
+		fmt.Printf("[swarm] presplit %d oversized seed item(s) into per-file sub-items\n", n)
+	}
+
 	// 3. Initial worker spawn.
 	for i := 0; i < r.cfg.initialWorkers; i++ {
 		if err := r.spawnWorker(ctx); err != nil {
@@ -1228,10 +1235,26 @@ func (r *swarmRunner) realResources(dir string, candidates []string) []string {
 	return kept
 }
 
+// splitThreshold is how many distinct real resources an item must name before
+// it is split. Two or more files means the work is parallelisable and one
+// worker would serialise it; one file means splitting buys nothing (the
+// symbol-level dedup already keeps same-file workers apart).
+const splitThreshold = 2
+
+// autoSplitItem splits a stuck item. Called from the item-hold breaker, i.e.
+// after a worker has already burned turns discovering the item was too big.
+// presplitOversizedItems is the fast path: same split, done before any worker
+// starts.
 func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
+	_ = r.splitItem(w.dir, itemID)
+}
+
+// splitItem decomposes itemID into one child per real resource. Returns true
+// when the item was split.
+func (r *swarmRunner) splitItem(dir, itemID string) bool {
 	item, err := r.store.GetItem(itemID)
 	if err != nil {
-		return
+		return false
 	}
 	total, _ := r.store.ItemCount()
 	depth, _ := r.store.ItemDepth(itemID)
@@ -1239,18 +1262,20 @@ func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
 	// "06-openai-chat-endpoint (tests) (core impl) (core impl) (core impl)"
 	// in practice, and those children all edit the same file.
 	if total >= r.cfg.maxItems || depth >= 2 {
-		return
+		return false
 	}
 	// Split by resource, not by "core impl" / "tests": every child must name
 	// exactly ONE resource token (path or path#symbol) so the stigmergy
 	// conflict scan can keep them apart. A child that names nothing concrete
 	// is worse than no split — it becomes an unfinishable god task.
-	resources := r.realResources(w.dir, store.ResourcesOf(item))
-	if len(resources) <= 1 {
+	resources := r.realResources(dir, store.ResourcesOf(item))
+	if len(resources) < splitThreshold {
 		// Nothing to split along: leave it for a stronger model / a human.
-		return
+		return false
 	}
-	_ = r.store.SetStatus(itemID, "split")
+	if err := r.store.SetStatus(itemID, "split"); err != nil {
+		return false
+	}
 	for _, res := range resources {
 		_, _ = r.store.CreateItem(server.CreateItemInput{
 			Peer: "auto-split",
@@ -1262,6 +1287,47 @@ func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
 			Kind:     "task",
 		})
 	}
+	return true
+}
+
+// presplitOversizedItems splits every seeded item that names more files than
+// one worker should serialise, BEFORE any worker starts.
+//
+// The alternative was waiting for a worker to discover the item was too big:
+// it burns maxItemTurns turns (and their tokens) before autoSplitItem fires,
+// and the whole time the other workers were idle waiting for board slots.
+// Measured on dola: a 4-item seed where every item named 3+ files, and the
+// first merge only happened at 2 minutes because one worker ground through
+// an oversized item first.
+//
+// Splitting at seed time means the board starts already parallel, and
+// --exit-when-done's seed-progress accounting sees the children (they carry
+// the seed lineage through parent_id).
+func (r *swarmRunner) presplitOversizedItems(dir string) int {
+	items, _, err := r.store.ListItems("pending", 0, 0)
+	if err != nil {
+		return 0
+	}
+	split := 0
+	for _, it := range items {
+		if it.CreatedBy != "seed" {
+			continue // only the operator's items; do not touch worker-created ones
+		}
+		res := r.realResources(dir, store.ResourcesOf(it))
+		if len(res) < splitThreshold {
+			continue
+		}
+		if r.splitItem(dir, it.ID) {
+			split++
+			r.logEvent(store.RunEvent{
+				Kind: store.EvItemSplit, Actor: "system", ItemID: it.ID,
+				Title: it.Title,
+				Detail: fmt.Sprintf("presplit into %d items (one per file)", len(res)),
+				Files: len(res),
+			})
+		}
+	}
+	return split
 }
 
 // ---------- integrator ----------
