@@ -35,19 +35,27 @@ That item names no files and no symbols. What happens:
    file do not conflict and are not folded into one.
 
 So a 30-minute job becomes several parallel 5-minute jobs without you writing
-a spec.
+a spec. **Splitting is the main path, not a fallback** — it is what makes a big
+job finish in a fraction of the time, because the pieces run at the same time
+instead of one after another.
+
+What splitting cannot do: if every piece touches the *same lines* of one file,
+the dedup folds them into a single item and the job stays serial. That is a
+property of the work, not of swarm.
 
 ### How the run knows when to stop
 
-There is no wall clock to set. The ceiling is a **silence timeout**:
+There is no wall clock to set. Splitting means a big job is already parallel by
+the time it matters, so the ceiling only has to answer "is anything still
+happening" — a **silence timeout**:
 
 - progress (a merge, a submission, an item reaching a terminal state) resets the timer
 - `--idle-stop` (default **10 min**) with no progress ends the run, with a full report
 - `--exit-when-done` (default on) exits as soon as **the items you seeded** are terminal — workers keep inventing useful bonus work, and that no longer holds the door open
 - a generous hard ceiling (`--max-wall-clock`, default 6h) remains only as a backstop for pathological cases
 
-Net effect: small jobs leave in minutes, big jobs run as long as they keep
-moving, dead ones stop within ten minutes.
+Net effect: small jobs leave in minutes, big jobs finish in the time of their
+longest *piece* (not their sum), dead ones stop within ten minutes.
 
 ### Interrupting and resuming
 
@@ -273,3 +281,4 @@ tables above: aggressive-split (+51% wall), speculative racing (+86% wall,
 - **git ref claim** (replace the SQLite single-writer): the throughput gate for 100+ workers. Not needed below that — three real runs showed no write-lock contention at 3–5 workers.
 - **LLM review of large diffs**: merge a >N-line change only after a model reviews it.
 - **`protectedPaths`**: require operator confirmation before certain files change.
+- **Split quality**: today a split is one child per file. A single 3000-line file still becomes one serial item; splitting *within* a file (by section) would need an AST-level view rather than a regex.
