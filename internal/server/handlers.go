@@ -59,6 +59,11 @@ func (s *Server) handleGetItem(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateItem serves POST /item.
+//
+// When the server runs with ForbidItemCreation set, only the seed path and the
+// auto-split path may create items; a worker trying to invent new top-level
+// work gets 403. This is the hard counterpart of the --no-create prompt rule —
+// the prompt is advisory, this is not.
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	var in CreateItemInput
 	if !decode(w, r, &in) {
@@ -80,12 +85,28 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 			in.ParentID = &p
 		}
 	}
+	if s.ForbidItemCreation && !s.itemCreationAllowed(in) {
+		writeError(w, http.StatusForbidden, "item creation is disabled: work on the existing board")
+		return
+	}
 	item, err := s.store.CreateItem(in)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+// itemCreationAllowed reports whether a create request may pass under
+// ForbidItemCreation. Allowed: the seeder (no peer), auto-split (peer
+// "auto-split"), and any request that attaches under an existing parent
+// (that is a split, not new top-level work).
+func (s *Server) itemCreationAllowed(in CreateItemInput) bool {
+	peer := strings.TrimSpace(in.Peer)
+	if peer == "" || peer == "auto-split" {
+		return true
+	}
+	return in.ParentID != nil
 }
 
 // handleClaim serves POST /claim, returning the task package.

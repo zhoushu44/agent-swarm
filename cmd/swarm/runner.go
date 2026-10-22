@@ -47,6 +47,23 @@ type runConfig struct {
 	apiKey             string
 	model              string
 	exitWhenDone       bool
+	// noCreate forbids workers from creating NEW items. The prompt normally
+	// tells a worker to "create one that advances the mission" when nothing
+	// pending suits it — good for open-ended exploration, but it means the
+	// board never drains and --exit-when-done never fires. Measured on dola:
+	// 4 seed items all finished, then workers invented 3 more top-level items
+	// that split into 13 children, stretching a 4-item run from ~5 min to 17.
+	// Default OFF: bonus work is real output, the operator chooses.
+	noCreate bool
+	// maxWallClock is a hard ceiling for the whole run (0 = unlimited). The
+	// backstop for "one worker is stuck for 100 minutes while the others
+	// finished in 5": every soft breaker is per-turn or per-item, so a worker
+	// that makes a tiny diff every turn never trips any of them.
+	maxWallClock time.Duration
+	// maxItemSeconds releases an item's lease when one worker has held it this
+	// long (0 = unlimited). The work already done is kept; the item goes back
+	// to pending with a FAIL note so the next worker does not repeat it.
+	maxItemSeconds int
 }
 
 func defaultRunConfig() runConfig {
@@ -102,6 +119,9 @@ type swarmRunner struct {
 	// itemSpend attributes token spend per item so the maxItemTokens breaker
 	// and cost reporting work. Keyed by item id, guarded by mu.
 	itemSpend map[string]int64
+	// mergedCount / rejectedCount drive the run report's integration line.
+	mergedCount   int
+	rejectedCount int
 
 	startMs time.Time
 }
@@ -224,8 +244,18 @@ func newSwarmRunner(dir string, cfg runConfig, st *store.Store) (*swarmRunner, e
 // reaper, then blocks until SIGINT/SIGTERM or budget exhaustion.
 func (r *swarmRunner) run(ctx context.Context) error {
 	r.startMs = time.Now()
+	// Durable run log: everything below also lands in .swarm/swarm.db's
+	// run_log table, so a later run (or another agent) can read what happened
+	// without this process's stdout.
+	r.logEvent(store.RunEvent{
+		Kind: store.EvRunStart, Actor: "system",
+		Detail: fmt.Sprintf("workers=%d/%d harness=%s model=%s mission=%q exitWhenDone=%v noCreate=%v wallClock=%v itemSeconds=%d",
+			r.cfg.initialWorkers, r.cfg.maxWorkers, r.cfg.harnessName, r.cfg.model,
+			r.cfg.mission, r.cfg.exitWhenDone, r.cfg.noCreate, r.cfg.maxWallClock, r.cfg.maxItemSeconds),
+	})
 	// 1. HTTP API server (workers use it for claim/submit/context).
 	srv := server.New(r.store)
+	srv.ForbidItemCreation = r.cfg.noCreate
 	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", r.cfg.serverPort), Handler: srv}
 	go func() {
 		_ = httpSrv.ListenAndServe()
@@ -260,24 +290,53 @@ func (r *swarmRunner) run(ctx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// exit-when-done: board clear + integration queue empty + no active workers.
+	// exit-when-done: SEED items all terminal + integration queue empty +
+	// no active workers.
+	//
+	// The old condition was "board is completely empty", which never fires in
+	// practice: workers invent new items (or split an item into children that
+	// then split again), so the board keeps growing long after the work the
+	// operator asked for is finished. Measured on dola: 4 seed items done in
+	// 5 min, board still had 13 open items at minute 17.
+	//
+	// Now: exit when every SEED item (created_by "seed", i.e. what was asked
+	// for) has reached a terminal state. Worker-created work may still be
+	// running; it is reported but does not hold the door open.
 	var doneWatch <-chan time.Time
 	if r.cfg.exitWhenDone {
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()
 		doneWatch = t.C
 	}
+	// Hard wall-clock ceiling for the whole run. Zero disables it. This is the
+	// backstop for "one worker is stuck for 100 minutes while the others
+	// finished in 5": every soft breaker is per-turn or per-item, so a worker
+	// that makes a tiny diff every turn never trips any of them.
+	var wallClock <-chan time.Time
+	if r.cfg.maxWallClock > 0 {
+		timer := time.NewTimer(r.cfg.maxWallClock)
+		defer timer.Stop()
+		wallClock = timer.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			r.report("signal")
 			goto shutdown
 		case <-sigCh:
+			r.report("signal")
 			goto shutdown
 		case <-r.stopCh:
+			r.report("stop")
+			goto shutdown
+		case <-wallClock:
+			r.logEvent(store.RunEvent{Kind: store.EvWallClock, Actor: "system",
+				Detail: "wall-clock ceiling reached, stopping with all work preserved"})
+			r.report("wall-clock")
 			goto shutdown
 		case <-doneWatch:
-			open, _ := r.store.OpenCount()
+			pending, _ := r.store.OpenCount()
 			queued := 0
 			if qs, err := r.store.QueuedSubmissions(); err == nil {
 				queued = len(qs)
@@ -290,14 +349,24 @@ func (r *swarmRunner) run(ctx context.Context) error {
 				}
 			}
 			r.mu.Unlock()
-			if open == 0 && queued == 0 && active == 0 {
+			seedOpen, seedTotal := r.seedProgress()
+			if seedOpen == 0 && seedTotal > 0 && queued == 0 && active == 0 {
 				stats, _ := r.store.Stats()
 				r.mu.Lock()
 				in, out, apiCalls := r.totalInputTokens, r.totalOutputTokens, r.totalAPICalls
 				r.mu.Unlock()
 				wall := time.Since(r.startMs).Milliseconds()
-				fmt.Printf("[swarm] DONE: {\"done\":%d,\"total\":%d,\"failed\":%d,\"integrations\":%d,\"tokenUsage\":{\"apiCalls\":%d,\"inputTokens\":%d,\"outputTokens\":%d},\"wallTimeMs\":%d}\n",
-					stats.Done, stats.Total, stats.Failed, stats.Submitted, apiCalls, in, out, wall)
+				r.logEvent(store.RunEvent{
+					Kind: store.EvSeedDone, Actor: "system",
+					Detail: fmt.Sprintf("all %d seed items terminal; %d extra item(s) still open (bonus work preserved)",
+						seedTotal, pending),
+					Tokens: in + out, Seconds: int(wall / 1000),
+				})
+				fmt.Printf("[swarm] DONE: {\"done\":%d,\"total\":%d,\"failed\":%d,\"integrations\":%d,\"seedDone\":%d,\"seedTotal\":%d,\"extraOpen\":%d,\"tokenUsage\":{\"apiCalls\":%d,\"inputTokens\":%d,\"outputTokens\":%d},\"wallTimeMs\":%d}\n",
+					stats.Done, stats.Total, stats.Failed, stats.Submitted,
+					seedTotal-seedOpen, seedTotal, pending,
+					apiCalls, in, out, wall)
+				r.report("seed-done")
 				goto shutdown
 			}
 		}
@@ -458,7 +527,7 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 		brief := r.buildBrief(w)
 
 		// Build prompt.
-		prompt := prompts.BuildWorkerPrompt(prompts.Options{
+		opts := prompts.Options{
 			PeerName:    w.name,
 			ServerPort:  r.cfg.serverPort,
 			Mission:     r.cfg.mission,
@@ -466,7 +535,17 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			Turn:        w.turn,
 			Brief:       brief,
 			Harness:     r.cfg.harnessName,
-		})
+		}
+		if r.cfg.noCreate {
+			opts.Rules = append(prompts.DefaultRules, prompts.Rule{
+				ID:        "no-create-items",
+				Priority:  0,
+				Category:  "claiming",
+				Text:      "Do NOT create new items (no POST /item). Work only on what the board already lists. If nothing suits you, finish the turn with IDLE.",
+				Rationale: "Keeps the board bounded so --exit-when-done can fire; workers otherwise invent new top-level work indefinitely.",
+			})
+		}
+		prompt := prompts.BuildWorkerPrompt(opts)
 
 		// Run turn via harness (AIMD-gated).
 		var result harness.Response
@@ -583,6 +662,10 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 				w.noProgressStreak++
 				if w.noProgressStreak >= r.cfg.maxNoProgressTurns {
 					fmt.Fprintf(os.Stderr, "[swarm] %s parked: %d turns with no submission (endpoint likely ignores tool_choice / non-agent model)\n", w.name, w.noProgressStreak)
+					r.logEvent(store.RunEvent{
+						Kind: store.EvWorkerPark, Actor: w.name,
+						Detail: fmt.Sprintf("%d turns with no submission", w.noProgressStreak),
+					})
 					w.status = "crashed"
 					return
 				}
@@ -604,6 +687,10 @@ if w.lastArtifact == "" || w.lastArtifact == w.prevArtifact {
 w.prevArtifact = w.lastArtifact
 if !w.emptyArtifactAt.IsZero() && time.Since(w.emptyArtifactAt) > 3*time.Duration(r.cfg.maxItemTurns)*time.Second {
 	fmt.Fprintf(os.Stderr, "[swarm] %s parked: %d turns with no new output (fingerprint %q static)\n", w.name, 3, w.lastArtifact)
+				r.logEvent(store.RunEvent{
+					Kind: store.EvWorkerPark, Actor: w.name,
+					Detail: "3 turns with no new output (artifact fingerprint static: " + w.lastArtifact + ")",
+				})
 	w.status = "crashed"
 	return
 }
@@ -806,6 +893,50 @@ func (r *swarmRunner) itemTokens(itemID string) int {
 	return int(r.itemSpend[itemID])
 }
 
+// seedProgress reports how many SEED items are still open, out of the total.
+// This is what --exit-when-done now keys on: the operator's own work, not the
+// whole board (workers keep inventing useful work after their assignment).
+func (r *swarmRunner) seedProgress() (open, total int) {
+	open, total, err := r.store.SeedProgress()
+	if err != nil {
+		return 0, 0
+	}
+	return open, total
+}
+
+// logEvent writes one structured event to the DB and echoes it to stdout.
+// Logging must never break a run, so errors are swallowed after one stderr
+// line.
+func (r *swarmRunner) logEvent(ev store.RunEvent) {
+	if ev.TS == 0 {
+		ev.TS = time.Now().UnixMilli()
+	}
+	if err := r.store.LogRunEvent(ev); err != nil {
+		fmt.Fprintf(os.Stderr, "[swarm] log write failed (%s): %v\n", ev.Kind, err)
+		return
+	}
+	if line := store.FormatEvent(ev, r.startMs.UnixMilli()); line != "" {
+		fmt.Println("[swarm] " + line)
+	}
+}
+
+// report renders and prints the end-of-run report.
+func (r *swarmRunner) report(stopReason string) {
+	r.mu.Lock()
+	in, out, apiCalls := r.totalInputTokens, r.totalOutputTokens, r.totalAPICalls
+	spend := make([]store.ItemSpend, 0, len(r.itemSpend))
+	for id, tok := range r.itemSpend {
+		spend = append(spend, store.ItemSpend{ItemID: id, Tokens: tok})
+	}
+	merged, rejected := r.mergedCount, r.rejectedCount
+	r.mu.Unlock()
+
+	rep := r.store.BuildRunReport(r.startMs, stopReason, merged, rejected, spend)
+	rep.InputTokens, rep.OutputTokens, rep.APICalls = in, out, int(apiCalls)
+	fmt.Print(rep.Render())
+	fmt.Println("[swarm] " + rep.ResumeHint())
+}
+
 // itemSpendSnapshot returns the (item -> tokens) ledger for reporting.
 func (r *swarmRunner) itemSpendSnapshot() map[string]int64 {
 	r.mu.Lock()
@@ -913,6 +1044,17 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 			Text:   fmt.Sprintf("integration failed for item %s: %s", sub.ItemID, reason),
 			ItemID: &sub.ItemID, Tags: []string{"integration", "failed"},
 		})
+		r.mu.Lock()
+		r.rejectedCount++
+		r.mu.Unlock()
+		kind := store.EvMergeReject
+		if res != nil && res.Arbitrated {
+			kind = store.EvGate
+		}
+		r.logEvent(store.RunEvent{
+			Kind: kind, Actor: "integrator", ItemID: sub.ItemID,
+			Detail: "merge/gate failed: " + firstLine(reason),
+		})
 		return
 	}
 
@@ -932,6 +1074,9 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 	}
 
 	_ = r.store.ResolveSubmission(sub.ID, true, "", r.cfg.maxItemFails)
+	r.mu.Lock()
+	r.mergedCount++
+	r.mu.Unlock()
 	if len(res.Files) > 0 {
 		stat := strings.Join(res.Files, "\n")
 		if len(stat) > 1200 {
@@ -943,6 +1088,38 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 			ItemID: &sub.ItemID, Tags: []string{"integration", "patch"},
 		})
 	}
+	// Structured log: the durable record of what landed, and whether the
+	// merge needed arbitration.
+	detail := "merged " + shortSha(res.SHA)
+	if res.Arbitrated {
+		detail += " (conflict resolved by model)"
+	}
+	if len(res.Files) > 0 {
+		detail += fmt.Sprintf(" — %d files", len(res.Files))
+	}
+	r.logEvent(store.RunEvent{
+		Kind: store.EvMerge, Actor: "integrator", ItemID: sub.ItemID,
+		Detail: detail, Files: len(res.Files),
+	})
+	r.logEvent(store.RunEvent{
+		Kind: store.EvItemDone, Actor: sub.Peer, ItemID: sub.ItemID,
+		Detail: "integrated and gated green",
+	})
+}
+
+// firstLine returns the first line of a (possibly multi-line) error string.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
+
+func shortSha(sha string) string {
+	if len(sha) > 10 {
+		return sha[:10]
+	}
+	return sha
 }
 
 // ---------- autoscaler ----------

@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 	"os/exec"
 	"path/filepath"
 
@@ -133,10 +135,55 @@ func main() {
 			case "--exit-when-done":
 				cfg.exitWhenDone = true
 				cfg.minWorkers = 0 // mirror JS: exit-when-done drops the idle-retire floor so the last worker can leave
+			case "--no-create":
+				cfg.noCreate = true
+			case "--max-wall-clock":
+				// accepts "20m", "90s", "1h30m"; 0 disables
+				if i+1 < len(args) {
+					if d, derr := time.ParseDuration(args[i+1]); derr == nil {
+						cfg.maxWallClock = d
+					} else {
+						fmt.Fprintf(os.Stderr, "run: --max-wall-clock %q: %v\n", args[i+1], derr)
+					}
+					i++
+				}
+			case "--max-item-seconds":
+				iw(&cfg.maxItemSeconds)
 			}
 		}
 		if err := cmdRun(dir, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "run: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "log":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "usage: swarm log <dir> [--kind KIND] [--item ID] [--limit N]\n")
+			os.Exit(1)
+		}
+		dir := args[0]
+		kind, itemID, limit := "", "", 50
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "--kind":
+				if i+1 < len(args) {
+					kind = args[i+1]
+					i++
+				}
+			case "--item":
+				if i+1 < len(args) {
+					itemID = args[i+1]
+					i++
+				}
+			case "--limit":
+				if i+1 < len(args) {
+					fmt.Sscanf(args[i+1], "%d", &limit)
+					i++
+				}
+			}
+		}
+		if err := cmdLog(dir, kind, itemID, limit); err != nil {
+			fmt.Fprintf(os.Stderr, "log: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -313,5 +360,57 @@ func cmdStatus(dir string) error {
 		digest.Stats.Done,
 		digest.Stats.Failed,
 	)
+	// Seed progress is the operator's real "are we done yet" number.
+	if open, total, serr := st.SeedProgress(); serr == nil && total > 0 {
+		fmt.Printf("seed work: %d/%d terminal (%d still open)\n", total-open, total, open)
+	}
+	return nil
+}
+
+// cmdLog prints the structured run log: what happened, in order, in a shape
+// both a human and a later agent can read.
+//
+//	swarm log <dir>                     last 50 events, newest first
+//	swarm log <dir> --kind MERGE        only merges
+//	swarm log <dir> --item t1           the timeline of one item, oldest first
+func cmdLog(dir, kind, itemID string, limit int) error {
+	st, err := openStore(dir)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if strings.TrimSpace(itemID) != "" {
+		evs, terr := st.ItemTimeline(itemID)
+		if terr != nil {
+			return terr
+		}
+		if len(evs) == 0 {
+			fmt.Printf("no events for item %s\n", itemID)
+			return nil
+		}
+		fmt.Printf("timeline for %s:\n", itemID)
+		for _, e := range evs {
+			fmt.Println("  " + store.FormatEvent(e, 0))
+		}
+		return nil
+	}
+
+	evs, err := st.RunLog(kind, limit)
+	if err != nil {
+		return err
+	}
+	if len(evs) == 0 {
+		fmt.Println("no events logged yet")
+		return nil
+	}
+	// Oldest-first reads better for a log; RunLog returns newest first.
+	for i, j := 0, len(evs)-1; i < j; i, j = i+1, j-1 {
+		evs[i], evs[j] = evs[j], evs[i]
+	}
+	start := evs[0].TS
+	for _, e := range evs {
+		fmt.Println(store.FormatEvent(e, start))
+	}
 	return nil
 }

@@ -171,6 +171,12 @@ type Server struct {
 	store Store
 	mux   *http.ServeMux
 	now   func() int64
+
+	// ForbidItemCreation rejects POST /item from workers (peer != "" and
+	// != "auto-split") unless the request attaches under an existing parent.
+	// Used by --no-create so the board stays bounded. The seed path (empty
+	// peer) and auto-split are always allowed.
+	ForbidItemCreation bool
 }
 
 // New returns a Server backed by store.

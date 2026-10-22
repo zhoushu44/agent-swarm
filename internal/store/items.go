@@ -128,6 +128,78 @@ func scanItem(row rowScanner) (server.Item, error) {
 	return it, nil
 }
 
+// SeedProgress counts the SEED items (created_by = "seed") by terminal state.
+//
+// Used by --exit-when-done: the operator's own items are what "done" means.
+// Worker-created items and auto-split children are excluded, so a swarm that
+// keeps exploring after finishing its assignment still reports completion
+// promptly instead of never exiting.
+func (s *Store) SeedProgress() (open, total int, err error) {
+	rows, err := s.db.Query(`SELECT status FROM items WHERE created_by = 'seed'`)
+	if err != nil {
+		return 0, 0, mapErr("seed progress", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		if serr := rows.Scan(&status); serr != nil {
+			return 0, 0, mapErr("seed progress scan", serr)
+		}
+		total++
+		switch status {
+		case StatusDone, StatusFailed:
+			// terminal
+		default:
+			open++
+		}
+	}
+	return open, total, rows.Err()
+}
+
+// TerminalSeedItems returns the seed items that reached done/failed, for the
+// run report. Ordered by id so the report is stable across calls.
+func (s *Store) TerminalSeedItems() ([]server.Item, error) {
+	rows, err := s.db.Query(
+		`SELECT ` + itemColumns + ` FROM items
+		 WHERE created_by = 'seed' AND status IN ('done','failed')
+		 ORDER BY id ASC`)
+	if err != nil {
+		return nil, mapErr("terminal seeds", err)
+	}
+	defer rows.Close()
+	out := []server.Item{}
+	for rows.Next() {
+		it, serr := scanItem(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// OpenItemSummary lists what is still open (any creator), so the report can
+// say "these were left running" instead of silently dropping them.
+func (s *Store) OpenItemSummary() ([]server.Item, error) {
+	rows, err := s.db.Query(
+		`SELECT ` + itemColumns + ` FROM items
+		 WHERE status NOT IN ('done','failed','split')
+		 ORDER BY id ASC`)
+	if err != nil {
+		return nil, mapErr("open items", err)
+	}
+	defer rows.Close()
+	out := []server.Item{}
+	for rows.Next() {
+		it, serr := scanItem(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // ListItems returns one page of items, optionally filtered by status.
 //
 // Ordering matches the JS store: priority desc, then creation order asc.
