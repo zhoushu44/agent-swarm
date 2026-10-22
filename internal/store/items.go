@@ -16,16 +16,54 @@ import (
 // The optional "#symbol" suffix is what makes symbol-level tasks possible:
 // "implement src/util/compact.js#compress" and
 // "test src/util/compact.js#compress" are two items that BOTH touch the same
-// symbol (so they conflict), while
-// "implement src/util/compact.js#compress" and
-// "implement src/util/compact.js#decompress" are two items that do NOT
-// conflict — and, crucially, are no longer folded into one item by dedup.
-var resourceRE = regexp.MustCompile(`[A-Za-z0-9_@.\/\\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?:#[A-Za-z_][A-Za-z0-9_]*)?`)
+// symbol (so they conflict), while "#compress" and "#decompress" variants do
+// NOT conflict — and, crucially, are no longer folded into one item by dedup.
+//
+// The regex is deliberately loose; looksLikeResource decides whether a
+// candidate is a real path. A bare word.ext shape is NOT enough: prose like
+// "error.message" otherwise becomes a "resource", and a real run split one
+// item into "error.messag", "error.msg", "error.error", "error.detail" —
+// four junk items that burned a worker each.
+var resourceRE = regexp.MustCompile(`(?:[A-Za-z0-9_.@-]+/)*[A-Za-z0-9_@.-]+\.[A-Za-z][A-Za-z0-9]{0,6}(?:#[A-Za-z_][A-Za-z0-9_]*)?`)
 
-// artifactRE is kept as the file-only view (no "#symbol") for callers that
-// want whole-file folding. Dedup uses resourceRE so symbol-level items stay
-// separate.
-var artifactRE = regexp.MustCompile(`[A-Za-z0-9_@.\/\\-]+\.[A-Za-z][A-Za-z0-9]{0,5}\b`)
+// knownExt lists file extensions accepted without requiring a slash in the
+// token. Keeping this explicit is what stops "error.message" from becoming a
+// resource: "message" is not a known extension, so the token is rejected.
+var knownExt = map[string]bool{
+	"js": true, "mjs": true, "cjs": true, "ts": true, "tsx": true, "jsx": true,
+	"go": true, "py": true, "rs": true, "java": true, "kt": true, "rb": true,
+	"php": true, "c": true, "h": true, "cc": true, "cpp": true, "hpp": true,
+	"cs": true, "swift": true, "scala": true, "sh": true, "bash": true, "ps1": true,
+	"json": true, "yaml": true, "yml": true, "toml": true, "ini": true, "env": true,
+	"md": true, "txt": true, "rst": true, "html": true, "htm": true, "css": true,
+	"scss": true, "less": true, "vue": true, "svelte": true, "xml": true, "svg": true,
+	"sql": true, "db": true, "csv": true, "tsv": true,
+	"png": true, "jpg": true, "jpeg": true, "gif": true, "webp": true, "ico": true,
+	"pdf": true, "zip": true, "tar": true, "gz": true, "lock": true, "log": true,
+	"test": true, "spec": true, "mod": true, "sum": true, "work": true,
+}
+
+// looksLikeResource applies the path heuristic to one candidate token.
+func looksLikeResource(tok string) bool {
+	t := strings.TrimSpace(strings.ReplaceAll(tok, `\`, "/"))
+	if t == "" {
+		return false
+	}
+	dot := strings.LastIndex(t, ".")
+	if dot <= 0 || dot == len(t)-1 {
+		return false
+	}
+	// A slash anywhere means it is a path: "src/util.js", "./a.js", "a/b/c.d".
+	if strings.Contains(t, "/") {
+		return true
+	}
+	// Otherwise the extension must be a known file extension.
+	ext := strings.ToLower(t[dot+1:])
+	if h := strings.IndexByte(ext, '#'); h >= 0 {
+		ext = ext[:h]
+	}
+	return knownExt[ext]
+}
 
 // artifactKey returns the normalized dedup key for a title: "f:<resource>"
 // (resource = path or path#symbol, lowercased, sorted+joined), else "".
@@ -37,12 +75,18 @@ func artifactKey(title string) string {
 	seen := map[string]bool{}
 	var uniq []string
 	for _, h := range hits {
-		n := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(h, `\`, `/`), `./`))
+		if !looksLikeResource(h) {
+			continue
+		}
+		n := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(h, `\`, "/"), "./"))
 		n = strings.TrimRight(n, ".,;:)")
 		if !seen[n] {
 			seen[n] = true
 			uniq = append(uniq, n)
 		}
+	}
+	if len(uniq) == 0 {
+		return ""
 	}
 	return "f:" + strings.Join(uniq, "|")
 }

@@ -159,8 +159,12 @@ func itemResources(it server.Item) []string {
 	out := []string{}
 	add := func(text string) {
 		for _, m := range resourceRE.FindAllString(text, -1) {
+			// Same path heuristic as artifactKey: prose like "error.message"
+			// must not become a resource.
+			if !looksLikeResource(m) {
+				continue
+			}
 			n := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(m, `\`, `/`), `./`))
-			// strip trailing punctuation the regex may have swallowed
 			n = strings.TrimRight(n, ".,;:)")
 			if n == "" || seen[n] {
 				continue
