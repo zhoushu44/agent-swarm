@@ -65,6 +65,12 @@ type runConfig struct {
 	// long (0 = unlimited). The work already done is kept; the item goes back
 	// to pending with a FAIL note so the next worker does not repeat it.
 	maxItemSeconds int
+	// idleStop is the adaptive run ceiling: stop after this long with NO
+	// progress (no merge, no submission, no item reaching a terminal state).
+	// Any progress resets it, so a long job that keeps moving runs as long as
+	// it needs, and a dead one stops within idleStop instead of running to a
+	// fixed ceiling. Default 10 minutes; 0 means "use the default".
+	idleStop time.Duration
 }
 
 // defaultRunConfig returns the shipped defaults.
@@ -101,8 +107,9 @@ func defaultRunConfig() runConfig {
 		serverPort:         17771,
 		harnessName:        "direct",
 		exitWhenDone:       true,
-		maxWallClock:       30 * time.Minute,
+		maxWallClock:       6 * time.Hour,
 		maxItemSeconds:     300,
+		idleStop:           10 * time.Minute,
 	}
 }
 
@@ -148,6 +155,11 @@ type swarmRunner struct {
 	// the tools, so the autoscaler stops respawning (otherwise it recycles
 	// worker names forever).
 	stalledSpawns int
+	// onProgress fires whenever the swarm makes real progress (a merge, a
+	// submission, an item reaching a terminal state). The run loop uses it to
+	// reset its silence timer, so the ceiling adapts to the work instead of
+	// being a fixed guess. Nil-safe.
+	onProgress func()
 
 	startMs time.Time
 }
@@ -354,10 +366,38 @@ func (r *swarmRunner) run(ctx context.Context) error {
 		defer t.Stop()
 		doneWatch = t.C
 	}
-	// Hard wall-clock ceiling for the whole run. Zero disables it. This is the
-	// backstop for "one worker is stuck for 100 minutes while the others
-	// finished in 5": every soft breaker is per-turn or per-item, so a worker
-	// that makes a tiny diff every turn never trips any of them.
+	// Adaptive run ceiling: a SILENCE timeout, not a wall clock.
+	//
+	// A fixed ceiling is wrong in both directions: it kills a big job that was
+	// still making progress, and it keeps a dead run alive for its full length.
+	// What matters is "has anything happened recently".
+	//
+	// Progress = a merge, a submission, or an item reaching a terminal state.
+	// Every such event resets the timer. When nothing happens for idleStop
+	// (default 10 minutes) the run is over: either everything finished, or the
+	// harness stopped driving tools, and more waiting will not change that.
+	//
+	// The hard ceiling (--max-wall-clock) stays as an absolute backstop for
+	// pathological cases (a worker that submits junk every 9 minutes forever),
+	// but by default it is generous rather than binding.
+	idleStop := r.cfg.idleStop
+	if idleStop <= 0 {
+		idleStop = 10 * time.Minute
+	}
+	idleTimer := time.NewTimer(idleStop)
+	defer idleTimer.Stop()
+	resetIdle := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleStop)
+	}
+	// Progress anywhere (merge / submit / terminal item) resets the timer.
+	r.onProgress = resetIdle
+
 	var wallClock <-chan time.Time
 	if r.cfg.maxWallClock > 0 {
 		timer := time.NewTimer(r.cfg.maxWallClock)
@@ -376,9 +416,18 @@ func (r *swarmRunner) run(ctx context.Context) error {
 		case <-r.stopCh:
 			r.report("stop")
 			goto shutdown
+		case <-idleTimer.C:
+			stats, _ := r.store.Stats()
+			r.logEvent(store.RunEvent{
+				Kind: store.EvWallClock, Actor: "system",
+				Detail: fmt.Sprintf("no progress for %v (merged=%d submitted=%d done=%d); stopping with all work preserved",
+					idleStop, r.mergedCount, stats.Submitted, stats.Done),
+			})
+			r.report("silence-timeout")
+			goto shutdown
 		case <-wallClock:
 			r.logEvent(store.RunEvent{Kind: store.EvWallClock, Actor: "system",
-				Detail: "wall-clock ceiling reached, stopping with all work preserved"})
+				Detail: "hard wall-clock ceiling reached, stopping with all work preserved"})
 			r.report("wall-clock")
 			goto shutdown
 		case <-doneWatch:
@@ -1349,6 +1398,11 @@ func (r *swarmRunner) integratorLoop(ctx context.Context) {
 		if err != nil || len(subs) == 0 {
 			continue
 		}
+		// A submission is progress: keep the run alive even if the merge then
+		// fails (the worker did work).
+		if r.onProgress != nil {
+			r.onProgress()
+		}
 		for _, s := range subs {
 			select {
 			case <-r.stopCh:
@@ -1423,6 +1477,10 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 	r.mu.Lock()
 	r.mergedCount++
 	r.mu.Unlock()
+	// A merge is progress: keep the run alive.
+	if r.onProgress != nil {
+		r.onProgress()
+	}
 	if len(res.Files) > 0 {
 		stat := strings.Join(res.Files, "\n")
 		if len(stat) > 1200 {

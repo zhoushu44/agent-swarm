@@ -152,6 +152,16 @@ func main() {
 				}
 			case "--max-item-seconds":
 				iw(&cfg.maxItemSeconds)
+			case "--idle-stop":
+				// "10m", "90s", "0" = use the default
+				if i+1 < len(args) {
+					if d, derr := time.ParseDuration(args[i+1]); derr == nil {
+						cfg.idleStop = d
+					} else {
+						fmt.Fprintf(os.Stderr, "run: --idle-stop %q: %v\n", args[i+1], derr)
+					}
+					i++
+				}
 			}
 		}
 		// exit-when-done drops the idle-retire floor so the LAST worker can
