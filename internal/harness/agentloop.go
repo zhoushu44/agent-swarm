@@ -373,6 +373,12 @@ func runBashTool(ctx context.Context, cmd, dir string, timeout time.Duration) st
 	if strings.TrimSpace(cmd) == "" {
 		return "(empty command)"
 	}
+	// Tool-level guard: refuse commands that edit files through a script or
+	// inline interpreter. A prompt rule asking for the write tool instead is
+	// advisory and the model ignored it repeatedly; this is not.
+	if v := CheckBashCommand(cmd); v.Blocked {
+		return "bash refused: " + v.Reason + ". " + v.Hint
+	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c := exec.CommandContext(cctx, "cmd", "/c", cmd)
