@@ -100,6 +100,31 @@ type MergeResult struct {
 	Files []string
 	// Noop is true when the branch had nothing new to merge.
 	Noop bool
+	// Arbitrated is true when the merge conflicted and a model resolved it.
+	Arbitrated bool
+}
+
+// arbitrate resolves the current conflict state in wt using r.Resolver.
+func (r *Repo) arbitrate(ctx context.Context, wt, from, branch string) error {
+	base, err := r.GitIn(ctx, wt, "merge-base", "HEAD", branch)
+	if err != nil {
+		return fmt.Errorf("gitutil: merge-base: %w", err)
+	}
+	files, err := r.ConflictedFiles(ctx, wt, strings.TrimSpace(base))
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("gitutil: no conflicted files to arbitrate")
+	}
+	if _, err := r.ArbitrateConflicts(ctx, wt, files, r.Resolver); err != nil {
+		return err
+	}
+	// Sanity: nothing may still be unmerged.
+	if r.HasConflicts(ctx, wt) {
+		return fmt.Errorf("gitutil: conflicts remain after arbitration")
+	}
+	return nil
 }
 
 // Integrate merges branch into the integration branch and runs the gate.
@@ -152,6 +177,32 @@ func (r *Repo) Integrate(ctx context.Context, branch, message string) (*MergeRes
 		mergeMsg = "integrate " + branch
 	}
 	if _, err := r.GitIn(ctx, wt, "merge", "--no-ff", "--no-edit", "-m", mergeMsg, branch); err != nil {
+		// Conflict: try to arbitrate before giving up. A rejected arbitration
+		// falls through to the same rollback as before, so this can only turn
+		// a guaranteed failure into a possible success.
+		if r.Resolver != nil && r.HasConflicts(ctx, wt) {
+			if aerr := r.arbitrate(ctx, wt, from, branch); aerr == nil {
+				if _, merr := r.GitIn(ctx, wt, "commit", "--no-edit"); merr == nil {
+					merged, herr := r.Head(ctx, wt)
+					if herr == nil {
+						res.SHA = merged
+						res.Arbitrated = true
+						if res.Files, herr = r.ChangedFiles(ctx, from, merged); herr != nil {
+							res.Files = nil
+						}
+						if gerr := r.RunGate(ctx, wt); gerr != nil {
+							r.rollback(ctx, wt, from)
+							return res, gerr
+						}
+						return res, nil
+					}
+				}
+			}
+			// Arbitration failed for any reason: clean the conflicted state so
+			// the rollback below starts from a known-good tree.
+			r.rollback(ctx, wt, from)
+			return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+		}
 		r.rollback(ctx, wt, from)
 		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
 	}

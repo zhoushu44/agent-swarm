@@ -58,6 +58,10 @@ type Repo struct {
 	GateCommand string
 	// Timeout bounds every git / gate invocation. Zero means five minutes.
 	Timeout time.Duration
+	// Resolver, when set, is asked to merge conflicted files during
+	// Integrate instead of immediately rolling back. Nil (the default) keeps
+	// the original behaviour: any conflict rejects the submission.
+	Resolver MergeResolver
 }
 
 // New returns a Repo rooted at dir with the swarm defaults applied.

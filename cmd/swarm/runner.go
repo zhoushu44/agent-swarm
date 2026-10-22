@@ -179,6 +179,31 @@ func newSwarmRunner(dir string, cfg runConfig, st *store.Store) (*swarmRunner, e
 		h = dh
 	}
 
+	// Three-way merge arbitration: on a merge conflict, ask the same model to
+	// produce the merged file instead of rejecting the submission outright.
+	// The gate still runs afterwards, so a bad arbitration is caught exactly
+	// like a bad hand-merge. Nil resolver (echo harness, or no API configured)
+	// keeps the original reject-and-retry behaviour.
+	if cfg.harnessName != "echo" && strings.TrimSpace(cfg.model) != "" {
+		repo.Resolver = func(ctx context.Context, cf gitutil.ConflictFile) (string, error) {
+			resp, err := h.Complete(ctx, harness.Request{
+				Model: cfg.model,
+				Messages: []harness.Message{
+					{Role: "user", Content: gitutil.MergePromptFor(cf)},
+				},
+				MaxTokens: 8192,
+			})
+			if err != nil {
+				return "", err
+			}
+			merged, err := gitutil.DecodeMerged(resp.Text)
+			if err != nil {
+				return "", err
+			}
+			return merged, nil
+		}
+	}
+
 	return &swarmRunner{
 		cfg:        cfg,
 		dir:        dir,
