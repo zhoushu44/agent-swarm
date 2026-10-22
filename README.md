@@ -2,6 +2,8 @@
 
 Go port of the [agent-swarm](../swarm) multi-agent parallel dev orchestrator. Workers claim items off a SQLite-backed board, drive an LLM through a 4-tool agent loop (bash / write / http / finish), and an integrator merges their worktrees.
 
+**Status: feature-complete.** 192 tests green. Every guard below was added after a real run demonstrated the failure it prevents; each entry names the measurement.
+
 ## Quick start
 
 ```bash
@@ -202,3 +204,72 @@ Both mechanisms are sound in the regime they were designed for (very few huge it
 3. **Item divergence** ([internal/store/items.go](internal/store/items.go)) — `CreateItem` dedups worker-created items by extracted file path (`f:` key, ported from JS `dedupKey`/`ARTIFACT_RE`), falling back to exact-title match. Seed callers bypass dedup.
 4. **DONE-line token accounting** ([cmd/swarm/runner.go](cmd/swarm/runner.go)) — runner accumulates `totalInputTokens` / `totalOutputTokens` / `totalAPICalls` itself so retired workers' spend is not lost when the reaper evicts them from the map. `apiCalls` now counts real agent-loop HTTP rounds (`lr.Steps`), not turns.
 5. **Bench mission constraint** ([bench/bench.ps1](../bench/bench.ps1)) — both sides run with `--mission` pinning scope to the 20 seeded utils, which is what actually stops LLM-driven divergence.
+
+---
+
+# Guards: what stops a run from wasting your time
+
+Every entry below was added **after a real run demonstrated the failure**. The
+measurement that motivated it is in the entry. Read this section if you want to
+know why swarm is shaped the way it is.
+
+## Coordination (no central scheduler)
+
+Workers do not message each other. They leave traces in a shared environment and
+read them — the stigmergy model. There is no lead agent, no global scheduler
+deciding who may run in parallel.
+
+| Mechanism | What it prevents |
+|---|---|
+| **Symbol-level resource keys** (`src/a.js#fn`) | Two items naming different functions of one file are separate items that do **not** conflict, instead of being folded into one or colliding at merge. |
+| **Containment conflict matching** | A worker editing `src/a.js` is warned about a claim on `src/a.js#fn` and vice versa. Exact-match `IN (...)` silently missed both. |
+| **`needsSplit` on claim** | A 30-minute job becomes N parallel 5-minute jobs. The first worker explores the code and creates one child per file — the operator writes intent, not a file list. |
+| **Presplit before workers start** | When the detail *does* name real files, splitting happens before any worker spawns, so the board starts parallel instead of one worker discovering the size the hard way. |
+| **Path validation (`looksLikeResource`)** | Prose like "try error.message" produced four junk items (`error.messag`, `error.msg`, `error.error`, `error.detail`), each burning a worker. Only real paths count now. |
+| **git-tracked whitelist for splits** | `chat.js` and `openai/http.js` are not files. Splitting along them created children nobody could open. `git ls-files` decides. |
+| **Three-way merge arbitration** | A merge conflict used to mean rollback + the item back to the pool + the whole task redone. Now the model resolves base/ours/theirs and the gate still judges the result. Measured: 2 of 8 submissions would have been wasted without it. |
+| **Incremental turn brief** | The brief used to carry every event since the last turn (14.5k chars and growing). It now carries only traces on the resources the worker's own items name, plus its own item's notes. |
+
+## Not wasting tokens
+
+| Mechanism | What it prevents |
+|---|---|
+| **Item-level ledger** (tokens / apiCalls / turnsHeld) | The report printed "3.75M tokens / 0 calls / 0 turns". Now you can see an item burned 2.6M tokens across 80 calls in 2 turns and release it. |
+| **`--max-item-seconds` (300)** | One worker held an item for 12 minutes while the rest of the board finished in 5. The lease is released with a FAIL note so the next worker does not repeat the dead end. |
+| **Artifact fingerprint breaker** | A worker that produces nothing for 3 turns is parked. The fingerprint counts tracked edits **and** new files **and** staged work — keying it on `git diff HEAD` alone parked workers that were productively creating files. |
+| **No-claim-no-submission retire** | A worker that neither claims nor submits for `maxItemTurns` turns retires. Echo harness (or any model that never drives tools) used to grind through all 60 turns. |
+| **Autoscaler give-up guard** | When spawns keep producing nothing, the pool stops growing. Combined with skipping the resource guard while giving up — CPU pressure from echo busy-spinning would otherwise reset the pool to 1 worker, a self-sustaining factory. |
+| **Scratch cleanup before commit** | `tmp_test_out.txt`, `scripts/_grep.js` and friends made the integrator reject the **entire** submission. One stray file wasted a whole turn. Cleaned automatically; measured 6 saves in one 15-minute run. |
+| **bash guard** | Workers wrote `tmp_patch.mjs` and ran `node tmp_patch.mjs` to edit source — ~4× the tool calls versus one `write`. Blocked at the tool layer, because the prompt rule asking for `write` instead was ignored five times in fifteen minutes. |
+| **Patch-script warning** | The same behaviour, surfaced in the log when the guard does not catch it. Prompt rules are advisory; visibility is not. |
+
+## Knowing what happened
+
+| Mechanism | What it prevents |
+|---|---|
+| **`swarm log`** | Stdout is transient. Every event lands in `run_log` with a closed vocabulary (RUN_START, MERGE, MERGE_REJECT, ARBITRATE, GATE, ITEM_*, WORKER_*, WALL_CLOCK) so a later agent can branch on them without parsing English. |
+| **Three-layer report** | SEED WORK (what you asked for) vs BONUS WORK (what the swarm found) vs STILL OPEN. Conflating them made a finished run look unfinished. |
+| **Seed lineage accounting** | `split` counted as open, and auto-split children were not seed work — so a run where every seed item was split and every child finished reported "2/4 terminal". Both fixed. |
+| **`--exit-when-done`** | "Done" means the items you seeded are terminal, not "the board is empty" — workers keep inventing useful work, so an empty board never happens. |
+| **Progress deltas on the status line** | `inflight=40960` never showed whether anything was happening. Now every 5s line says `+N done +M subm` or `NO PROGRESS`, plus `STALLED=[w1(np3)]` for workers holding a claim while getting nowhere. |
+| **Resume without redo** | Finished items are not re-claimable. A 50-minute job split across three runs costs three runs' worth of work, not 3× the work. The report states exactly what resumes. |
+
+## When the run ends
+
+| Mechanism | What it prevents |
+|---|---|
+| **Silence timeout (`--idle-stop`, 10m)** | A fixed wall clock kills a big job that was still moving and keeps a dead one alive its full length. Progress (merge / submit / terminal item) resets the timer, so the ceiling adapts. |
+| **Hard ceiling (`--max-wall-clock`, 6h)** | Backstop only, for pathological cases like a worker that submits junk every 9 minutes. Deliberately generous so it is not the binding constraint. |
+| **`--exit-when-done`** | Small jobs leave in minutes instead of waiting out a ceiling. |
+
+## Measured-and-rejected
+
+Kept so these don't get re-proposed without new evidence. See the benchmark
+tables above: aggressive-split (+51% wall), speculative racing (+86% wall,
+2.6× tokens), both (+253% wall, 3.9× tokens).
+
+## Still open
+
+- **git ref claim** (replace the SQLite single-writer): the throughput gate for 100+ workers. Not needed below that — three real runs showed no write-lock contention at 3–5 workers.
+- **LLM review of large diffs**: merge a >N-line change only after a model reviews it.
+- **`protectedPaths`**: require operator confirmation before certain files change.
