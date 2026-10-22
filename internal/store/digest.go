@@ -81,7 +81,20 @@ func (s *Store) Digest(peer string, since int64) (server.Digest, error) {
 	}
 
 	// Shared memory published since the caller's last turn.
-	d.NewContext = []server.ContextEntry{}
+//
+// Incremental context loading: return only the traces that can affect
+// THIS worker's decisions —
+//   (a) live marks on a resource one of the caller's claimed items names
+//       (someone else is in my file / my file has a stale conclusion), or
+//   (b) notes explicitly attached to one of those items.
+// Everything else is noise that costs prompt tokens every turn; the
+// measured 14.5k-char brief is mostly this.
+//
+// A caller with no claims falls back to the full feed so a freshly
+// spawned worker still sees recent history.
+d.NewContext = []server.ContextEntry{}
+claimed := s.claimedItemIDs(peer)
+if len(claimed) == 0 {
 	ctxRows, err := s.db.Query(`SELECT `+eventColumns+` FROM events WHERE ts >= ? ORDER BY id ASC`, since)
 	if err != nil {
 		return server.Digest{}, mapErr("digest context", err)
@@ -90,7 +103,7 @@ func (s *Store) Digest(peer string, since int64) (server.Digest, error) {
 		e, err := scanEvent(ctxRows)
 		if err != nil {
 			ctxRows.Close()
-			return server.Digest{}, mapErr("digest context", err)
+			return server.Digest{}, err
 		}
 		d.NewContext = append(d.NewContext, e)
 	}
@@ -98,7 +111,38 @@ func (s *Store) Digest(peer string, since int64) (server.Digest, error) {
 	if err := ctxRows.Err(); err != nil {
 		return server.Digest{}, mapErr("digest context", err)
 	}
+} else {
+	marks, err := s.MarksFor(s.resourcesOfItems(claimed), 60)
+	if err != nil {
+		return server.Digest{}, mapErr("digest marks", err)
+	}
+	d.NewContext = append(d.NewContext, marks...)
 
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(claimed)), ",")
+	args := []any{since}
+	for _, id := range claimed {
+		args = append(args, id)
+	}
+	rows, err := s.db.Query(
+		`SELECT `+eventColumns+` FROM events
+		 WHERE ts >= ? AND item_id IN (`+placeholders+`)
+		 ORDER BY id ASC`, args...)
+	if err != nil {
+		return server.Digest{}, mapErr("digest item context", err)
+	}
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			rows.Close()
+			return server.Digest{}, err
+		}
+		d.NewContext = append(d.NewContext, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return server.Digest{}, mapErr("digest item context", err)
+	}
+}
 	// The caller's messages.
 	msgs, err := s.Messages(peer, since)
 	if err != nil {
@@ -107,4 +151,49 @@ func (s *Store) Digest(peer string, since int64) (server.Digest, error) {
 	d.Messages = msgs
 
 	return d, nil
+}
+
+// claimedItemIDs returns the ids of items the peer currently holds a live
+// claim on.
+func (s *Store) claimedItemIDs(peer string) []string {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
+		return nil
+	}
+	rows, err := s.db.Query(
+		`SELECT i.id FROM items i
+		 JOIN claims c ON c.item_id = i.id
+		 WHERE c.peer = ? AND c.expires_at > ?`, peer, s.clock())
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return out
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// resourcesOfItems collects the resource tokens named by the given items.
+func (s *Store) resourcesOfItems(itemIDs []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range itemIDs {
+		it, err := s.GetItem(id)
+		if err != nil {
+			continue
+		}
+		for _, r := range ResourcesOf(it) {
+			if !seen[r] {
+				seen[r] = true
+				out = append(out, r)
+			}
+		}
+	}
+	return out
 }
