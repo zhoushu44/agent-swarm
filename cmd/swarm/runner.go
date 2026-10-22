@@ -81,6 +81,10 @@ type swarmRunner struct {
 
 	mu       sync.Mutex
 	workers  map[string]*workerState
+	// itemHoldBy records which worker currently holds which item, so the
+	// progress line can tell "idle" apart from "holding a claim and getting
+	// nowhere". Written when a claim is taken, cleared on release/exit.
+	itemHoldBy map[string]string
 	stopped  bool
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -94,6 +98,10 @@ type swarmRunner struct {
 	totalOutputTokens int64
 	totalAPICalls     int64
 	budgetExceeded    bool
+
+	// itemSpend attributes token spend per item so the maxItemTokens breaker
+	// and cost reporting work. Keyed by item id, guarded by mu.
+	itemSpend map[string]int64
 
 	startMs time.Time
 }
@@ -165,16 +173,18 @@ func newSwarmRunner(dir string, cfg runConfig, st *store.Store) (*swarmRunner, e
 	}
 
 	return &swarmRunner{
-		cfg:      cfg,
-		dir:      dir,
-		repo:     repo,
-		store:    st,
-		gate:     gate,
-		guard:    sysload.NewGuard(nil, sysload.Config{}),
-		harness:  h,
-		workers:  make(map[string]*workerState),
-		stopCh:   make(chan struct{}),
-		submitCh: make(chan struct{}, 1),
+		cfg:        cfg,
+		dir:        dir,
+		repo:       repo,
+		store:      st,
+		gate:       gate,
+		guard:      sysload.NewGuard(nil, sysload.Config{}),
+		harness:    h,
+		workers:    make(map[string]*workerState),
+		itemHoldBy: make(map[string]string),
+		itemSpend:  make(map[string]int64),
+		stopCh:     make(chan struct{}),
+		submitCh:   make(chan struct{}, 1),
 	}, nil
 }
 
@@ -477,6 +487,14 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			r.totalInputTokens += int64(result.Usage.PromptTokens)
 			r.totalOutputTokens += int64(result.Usage.CompletionTokens)
 			r.totalAPICalls += int64(loopSteps) // real HTTP rounds, not turns
+			// Item-level ledger: attribute this round's spend to whatever item
+			// the worker holds. Without it the maxItemTokens circuit breaker
+			// reads a constant 0 and never fires.
+			if claims, cerr := r.store.ActiveClaimsByPeer(w.name); cerr == nil {
+				for _, c := range claims {
+					r.itemSpend[c.ItemID] += int64(result.Usage.TotalTokens)
+				}
+			}
 			r.mu.Unlock()
 		}
 
@@ -529,6 +547,11 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			}
 			// Item hold circuit breaker: abandon after maxItemTurns or maxItemTokens.
 			claims, _ := r.store.ActiveClaimsByPeer(w.name)
+r.mu.Lock()
+for _, c := range claims {
+	r.itemHoldBy[w.name] = c.ItemID
+}
+r.mu.Unlock()
 			for _, c := range claims {
 				if w.itemHold == nil || w.itemHold.itemID != c.ItemID {
 					w.itemHold = &itemHold{itemID: c.ItemID, turns: 1, since: time.Now()}
@@ -539,6 +562,9 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 				if w.itemHold.turns > r.cfg.maxItemTurns || itemTokens > r.cfg.maxItemTokens {
 					r.autoSplitItem(w, c.ItemID)
 					_ = r.store.Release(c.Token)
+r.mu.Lock()
+delete(r.itemHoldBy, w.name)
+r.mu.Unlock()
 					w.itemHold = nil
 				}
 			}
@@ -677,8 +703,20 @@ func (r *swarmRunner) autoCommit(ctx context.Context, w *workerState) (string, e
 }
 
 func (r *swarmRunner) itemTokens(itemID string) int {
-	// Simplified: we don't track per-item tokens yet.
-	return 0
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return int(r.itemSpend[itemID])
+}
+
+// itemSpendSnapshot returns the (item -> tokens) ledger for reporting.
+func (r *swarmRunner) itemSpendSnapshot() map[string]int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int64, len(r.itemSpend))
+	for k, v := range r.itemSpend {
+		out[k] = v
+	}
+	return out
 }
 
 func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
@@ -907,6 +945,8 @@ func (r *swarmRunner) progressLoop(ctx context.Context) {
 	defer t.Stop()
 	var lastTok int64
 	var lastTs time.Time
+	var lastDone, lastSubm int
+	firstSample := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -924,8 +964,15 @@ func (r *swarmRunner) progressLoop(ctx context.Context) {
 			}
 			r.mu.Lock()
 			wparts := make([]string, 0, len(r.workers))
+			stalled := []string{}
 			for _, w := range r.workers {
 				wparts = append(wparts, w.name+":"+w.status)
+				// A worker holding a claim while its no-progress streak climbs
+				// is exactly what the operator needs to see; the old
+				// "inflight=40960" line never showed it.
+				if _, held := r.itemHoldBy[w.name]; held && w.noProgressStreak > 0 {
+					stalled = append(stalled, fmt.Sprintf("%s(np%d)", w.name, w.noProgressStreak))
+				}
 			}
 			tok := r.tokensSpent
 			r.mu.Unlock()
@@ -937,14 +984,34 @@ func (r *swarmRunner) progressLoop(ctx context.Context) {
 					rate = fmt.Sprintf(" | %.0f tok/s", float64(tok-lastTok)/dt)
 				}
 			}
+			// Deltas since the previous sample: the honest liveness signal.
+			delta := ""
+			if firstSample {
+				delta = " | (sampling)"
+			} else {
+				dDone := stats.Done - lastDone
+				dSubm := stats.Submitted - lastSubm
+				if dDone > 0 || dSubm > 0 {
+					delta = fmt.Sprintf(" | +%d done +%d subm", dDone, dSubm)
+				} else {
+					delta = " | NO PROGRESS"
+				}
+			}
+			firstSample = false
 			lastTok = tok
 			lastTs = now
+			lastDone = stats.Done
+			lastSubm = stats.Submitted
 
+			stalledPart := ""
+			if len(stalled) > 0 {
+				stalledPart = " STALLED=[" + joinNonEmpty(stalled, " ") + "]"
+			}
 			elapsed := int(now.Sub(r.startMs).Seconds())
-			fmt.Printf("[%02d:%02d] pending=%d inprog=%d submtd=%d done=%d/%d integ=%d inflight=%d w=[%s]%s\n",
+			fmt.Printf("[%02d:%02d] pending=%d inprog=%d submtd=%d done=%d/%d integ=%d inflight=%d w=[%s]%s%s%s\n",
 				elapsed/60, elapsed%60,
 				stats.Pending, stats.InProgress, stats.Submitted, stats.Done, stats.Total,
-				queued, r.gate.Limit(), joinNonEmpty(wparts, " "), rate)
+				queued, r.gate.Limit(), joinNonEmpty(wparts, " "), rate, delta, stalledPart)
 		}
 	}
 }
