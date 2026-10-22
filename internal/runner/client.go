@@ -112,6 +112,10 @@ type ClaimResult struct {
 	Token   string                   `json:"token"`
 	Item    *protocol.Item           `json:"item"`
 	History []*protocol.ContextEntry `json:"history"`
+	// NeedsSplit means this seeded top-level item has never been decomposed:
+	// the worker should list the files involved and create one child per file
+	// before implementing anything.
+	NeedsSplit bool `json:"needsSplit,omitempty"`
 }
 
 // Client talks to the swarm HTTP API.

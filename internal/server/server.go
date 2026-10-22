@@ -112,11 +112,18 @@ type Digest struct {
 // Conflicts carries live INTENT marks held by OTHER peers on the resources
 // this item touches. The worker decides for itself whether to proceed, work
 // around, or pick a different item — no scheduler makes that call.
+//
+// NeedsSplit tells the worker to decompose this item BEFORE implementing it: it
+// is a seeded top-level item that has never been split. The first worker to
+// claim it lists the files involved and creates one child per file, then works
+// on one of them. That is how a 30-minute job becomes N parallel jobs without
+// the operator writing a detailed spec.
 type ClaimResult struct {
-	Token     string         `json:"token"`
-	Item      Item           `json:"item"`
-	History   []ContextEntry `json:"history"`
-	Conflicts []ConflictInfo `json:"conflicts,omitempty"`
+	Token      string         `json:"token"`
+	Item       Item           `json:"item"`
+	History    []ContextEntry `json:"history"`
+	Conflicts  []ConflictInfo `json:"conflicts,omitempty"`
+	NeedsSplit bool           `json:"needsSplit,omitempty"`
 }
 
 // ConflictInfo describes one live intent on a contended resource.
@@ -156,6 +163,10 @@ type Store interface {
 	Release(token string) error
 	Renew(token string) error
 	Submit(token, peer, commitSha string) (Item, error)
+
+	// NeedsSplit reports whether the first worker to claim this item should
+	// decompose it instead of implementing it.
+	NeedsSplit(itemID string) (bool, error)
 
 	AddContext(entry ContextEntry) (ContextEntry, error)
 	SearchContext(q string, limit int) ([]ContextEntry, error)

@@ -132,6 +132,11 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if res.History == nil {
 		res.History = []ContextEntry{}
 	}
+	// Tell the worker whether to decompose first. Checked after the claim so
+	// two workers racing on the same item cannot both be told to split it.
+	if needs, nerr := s.store.NeedsSplit(in.ItemID); nerr == nil {
+		res.NeedsSplit = needs
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 

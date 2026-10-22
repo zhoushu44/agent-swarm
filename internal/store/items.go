@@ -262,6 +262,47 @@ func (s *Store) ListItems(status string, limit, offset int) ([]server.Item, int,
 	return items, total, nil
 }
 
+// ChildCount returns how many items were split off from parentID.
+func (s *Store) ChildCount(parentID string) (int, error) {
+	parentID = strings.TrimSpace(parentID)
+	if parentID == "" {
+		return 0, invalid("child count", "missing parentId")
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM items WHERE parent_id = ?`, parentID).Scan(&n); err != nil {
+		return 0, mapErr("child count", err)
+	}
+	return n, nil
+}
+
+// NeedsSplit reports whether an item should be decomposed by its first worker:
+// it is a seeded item, it has never been split, and it is not itself a child
+// (children are already one-file tasks). The worker that claims such an item
+// spends its first turn listing the files involved and creating one child per
+// file, so a 30-minute job becomes N parallel jobs without a human writing a
+// detailed spec.
+func (s *Store) NeedsSplit(itemID string) (bool, error) {
+	item, err := s.GetItem(itemID)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(item.CreatedBy) != "seed" {
+		return false, nil
+	}
+	if item.ParentID != nil {
+		return false, nil // already a child
+	}
+	switch item.Status {
+	case StatusSplit, StatusDone, StatusFailed:
+		return false, nil
+	}
+	n, err := s.ChildCount(itemID)
+	if err != nil {
+		return false, err
+	}
+	return n == 0, nil
+}
+
 // GetItem returns one item by id.
 func (s *Store) GetItem(id string) (server.Item, error) {
 	id = strings.TrimSpace(id)

@@ -184,6 +184,33 @@ func (m *MemStore) Submit(token, peer, commitSha string) (Item, error) {
 	return *it, nil
 }
 
+// NeedsSplit implements Store. Mirrors the SQLite rule: a seeded top-level item
+// with no children yet should be decomposed by its first worker.
+func (m *MemStore) NeedsSplit(itemID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	it, ok := m.items[strings.TrimSpace(itemID)]
+	if !ok {
+		return false, fmt.Errorf("item %s: %w", itemID, ErrNotFound)
+	}
+	if strings.TrimSpace(it.CreatedBy) != "seed" {
+		return false, nil
+	}
+	if it.ParentID != nil {
+		return false, nil
+	}
+	switch it.Status {
+	case "split", "done", "failed":
+		return false, nil
+	}
+	for _, child := range m.items {
+		if child.ParentID != nil && *child.ParentID == it.ID {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // AddContext implements Store.
 func (m *MemStore) AddContext(entry ContextEntry) (ContextEntry, error) {
 	m.mu.Lock()
