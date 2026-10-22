@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -797,6 +798,12 @@ func (r *swarmRunner) noOpenWork() bool {
 // cleanScratchFiles removes the scratch artefacts the integrator would reject,
 // so one stray helper file cannot waste a whole submission. Returns what was
 // removed.
+//
+// It also flags PATCH SCRIPTS specifically: a .mjs/.js file the worker wrote
+// to edit other files (observed: tmp_patch.mjs, tmp_t68_patch.js,
+// tmp_addtests.js) is a sign it is using bash+node instead of the write tool,
+// which costs roughly 4x the tool calls. The prompt says not to; this makes
+// the behaviour visible in the log so it can be measured.
 func (r *swarmRunner) cleanScratchFiles(ctx context.Context, dir string) []string {
 	out, err := r.repo.GitIn(ctx, dir, "status", "--porcelain")
 	if err != nil {
@@ -820,6 +827,9 @@ func (r *swarmRunner) cleanScratchFiles(ctx context.Context, dir string) []strin
 		if len(gitutil.RejectedArtifacts([]string{path})) == 0 {
 			continue
 		}
+		if isPatchScript(path) {
+			fmt.Fprintf(os.Stderr, "[swarm] WARNING: %s looks like a patch script (use the write tool to edit files, not a script)\n", path)
+		}
 		// Remove from the index and the working tree. `git clean -f` on a
 		// single path is the safest form: it only touches that path.
 		_, _ = r.repo.GitIn(ctx, dir, "rm", "--cached", "--force", "--", path)
@@ -827,6 +837,19 @@ func (r *swarmRunner) cleanScratchFiles(ctx context.Context, dir string) []strin
 		removed = append(removed, path)
 	}
 	return removed
+}
+
+// isPatchScript reports whether path is a script the worker wrote to edit
+// other files rather than a deliverable.
+func isPatchScript(p string) bool {
+	lower := strings.ToLower(p)
+	if !strings.HasSuffix(lower, ".mjs") && !strings.HasSuffix(lower, ".js") &&
+		!strings.HasSuffix(lower, ".py") && !strings.HasSuffix(lower, ".ps1") {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(strings.ReplaceAll(p, "\\", "/")))
+	return strings.HasPrefix(base, "tmp_") || strings.Contains(base, "patch") ||
+		strings.Contains(base, "addtest") || strings.Contains(base, "edit")
 }
 
 func (r *swarmRunner) releaseWorkerClaims(w *workerState) {
