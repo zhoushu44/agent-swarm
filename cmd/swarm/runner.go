@@ -673,10 +673,16 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 				w.noProgressStreak = 0
 			}
 
-// Empty-output breaker: the fingerprint from the last auto-commit says
-// whether the turn produced anything. A static (or empty) fingerprint
-// across turns means the model is talking, not working — park it instead
-// of burning its whole token budget.
+// Empty-output breaker: the fingerprint says whether the turn produced
+// anything at all — tracked edits, new files, or staged work. A static (or
+// empty) fingerprint across turns means the model is talking, not working, so
+// park it instead of burning its whole token budget.
+//
+// The fingerprint is recomputed EVERY turn (not only when autoCommit found
+// something to commit): a worker that creates new files without ever editing
+// a tracked one has an empty `git diff HEAD`, and keying this on the diff
+// alone parked productive workers on a real run.
+w.lastArtifact = r.artifactFingerprint(ctx, w.dir)
 if w.lastArtifact == "" || w.lastArtifact == w.prevArtifact {
 	if w.emptyArtifactAt.IsZero() {
 		w.emptyArtifactAt = time.Now()
@@ -708,12 +714,35 @@ r.mu.Unlock()
 					w.itemHold.turns++
 				}
 				itemTokens := r.itemTokens(c.ItemID)
-				if w.itemHold.turns > r.cfg.maxItemTurns || itemTokens > r.cfg.maxItemTokens {
+				// Wall-clock hold limit: the other breakers are per-turn or
+				// per-output, so a worker that makes a tiny diff every turn
+				// never trips any of them and can hold an item indefinitely
+				// ("one worker stuck for 100 minutes while the rest finished
+				// in 5"). Releasing here keeps the work already done and hands
+				// the item back with a FAIL note so the next worker does not
+				// repeat the same dead end.
+				heldFor := time.Since(w.itemHold.since)
+				overClock := r.cfg.maxItemSeconds > 0 && heldFor > time.Duration(r.cfg.maxItemSeconds)*time.Second
+				if w.itemHold.turns > r.cfg.maxItemTurns || itemTokens > r.cfg.maxItemTokens || overClock {
+					if overClock {
+						r.logEvent(store.RunEvent{
+							Kind: store.EvItemReleased, Actor: w.name, ItemID: c.ItemID,
+							Detail: fmt.Sprintf("held %s > %ds limit; released back to the pool (work so far kept)",
+								heldFor.Round(time.Second), r.cfg.maxItemSeconds),
+							Seconds: int(heldFor.Seconds()),
+						})
+						_, _ = r.store.AddContext(server.ContextEntry{
+							Peer: w.name, Kind: "FAIL", ItemID: &c.ItemID,
+							Text: fmt.Sprintf("released after %s (over the %ds per-item limit) — do not repeat this approach; try a different one",
+								heldFor.Round(time.Second), r.cfg.maxItemSeconds),
+							Tags: []string{"item", "timeout"},
+						})
+					}
 					r.autoSplitItem(w, c.ItemID)
 					_ = r.store.Release(c.Token)
-r.mu.Lock()
-delete(r.itemHoldBy, w.name)
-r.mu.Unlock()
+					r.mu.Lock()
+					delete(r.itemHoldBy, w.name)
+					r.mu.Unlock()
 					w.itemHold = nil
 				}
 			}
@@ -763,6 +792,41 @@ func (r *swarmRunner) activeCount() int {
 func (r *swarmRunner) noOpenWork() bool {
 	open, _ := r.store.OpenCount()
 	return open == 0
+}
+
+// cleanScratchFiles removes the scratch artefacts the integrator would reject,
+// so one stray helper file cannot waste a whole submission. Returns what was
+// removed.
+func (r *swarmRunner) cleanScratchFiles(ctx context.Context, dir string) []string {
+	out, err := r.repo.GitIn(ctx, dir, "status", "--porcelain")
+	if err != nil {
+		return nil
+	}
+	var removed []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if len(line) < 4 {
+			continue
+		}
+		// porcelain format: XY <path> (or XY <path> -> <path> for renames)
+		path := strings.TrimSpace(line[3:])
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+4:]
+		}
+		path = strings.Trim(path, `"`)
+		if path == "" {
+			continue
+		}
+		if len(gitutil.RejectedArtifacts([]string{path})) == 0 {
+			continue
+		}
+		// Remove from the index and the working tree. `git clean -f` on a
+		// single path is the safest form: it only touches that path.
+		_, _ = r.repo.GitIn(ctx, dir, "rm", "--cached", "--force", "--", path)
+		_, _ = r.repo.GitIn(ctx, dir, "clean", "-f", "--", path)
+		removed = append(removed, path)
+	}
+	return removed
 }
 
 func (r *swarmRunner) releaseWorkerClaims(w *workerState) {
@@ -840,6 +904,14 @@ func (r *swarmRunner) buildBrief(w *workerState) string {
 }
 
 func (r *swarmRunner) autoCommit(ctx context.Context, w *workerState) (string, error) {
+	// Drop scratch files BEFORE committing: a worker legitimately writes
+	// helper scripts (observed: scripts/_grep.js, scripts/_read.js) and test
+	// output (tmp_test_out.txt), but committing them makes the integrator
+	// reject the whole submission — one stray file wastes the entire turn.
+	// Cleaning here is a tool-level guarantee, unlike a prompt rule.
+	if removed := r.cleanScratchFiles(ctx, w.dir); len(removed) > 0 {
+		fmt.Fprintf(os.Stderr, "[swarm] %s: dropped scratch files before commit: %s\n", w.name, strings.Join(removed, ", "))
+	}
 	dirty, err := r.repo.IsDirty(ctx, w.dir)
 	if err != nil || !dirty {
 		return "", err
@@ -856,24 +928,62 @@ func (r *swarmRunner) autoCommit(ctx context.Context, w *workerState) (string, e
 	return sha, nil
 }
 
-// artifactFingerprint summarises what a worktree has actually produced. It
-// returns a compact string; an empty string means "nothing measurable".
+// artifactFingerprint summarises what a worktree has actually produced.
+//
+// It must count MORE than tracked modifications: a worker that creates new
+// files (the common case — and observed on dola, where workers wrote
+// scripts/_grep.js and scripts/_read.js to help themselves read the code)
+// shows an EMPTY `git diff HEAD` while doing real work. Keying the
+// empty-output breaker on that alone parks a productive worker.
+//
+// So the fingerprint is (tracked diff lines, untracked file count, HEAD sha):
+//   - tracked diff catches edits
+//   - untracked count catches new files
+//   - HEAD catches commits (which normally clear the diff)
 func (r *swarmRunner) artifactFingerprint(ctx context.Context, dir string) string {
-	out, err := r.repo.GitIn(ctx, dir, "diff", "--numstat", "HEAD")
-	if err != nil || strings.TrimSpace(out) == "" {
-		return ""
-	}
-	files, add, del := 0, 0, 0
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		parts := strings.Split(line, "\t")
-		if len(parts) < 3 {
-			continue
+	var sb strings.Builder
+
+	// 1) tracked changes since HEAD
+	if out, err := r.repo.GitIn(ctx, dir, "diff", "--numstat", "HEAD"); err == nil {
+		files, add, del := 0, 0, 0
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			parts := strings.Split(line, "\t")
+			if len(parts) < 3 {
+				continue
+			}
+			files++
+			add += atoiSafe(parts[0])
+			del += atoiSafe(parts[1])
 		}
-		files++
-		add += atoiSafe(parts[0])
-		del += atoiSafe(parts[1])
+		fmt.Fprintf(&sb, "f%d+%d-%d", files, add, del)
+	} else {
+		sb.WriteString("f?")
 	}
-	return fmt.Sprintf("f%d+%d-%d", files, add, del)
+
+	// 2) untracked files (excluding the noise git itself ignores)
+	if out, err := r.repo.GitIn(ctx, dir, "ls-files", "--others", "--exclude-standard"); err == nil {
+		n := 0
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			if strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		fmt.Fprintf(&sb, "u%d", n)
+	}
+
+	// 3) staged-but-uncommitted work counts as output too
+	if out, err := r.repo.GitIn(ctx, dir, "diff", "--cached", "--numstat"); err == nil {
+		n := 0
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			if strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		if n > 0 {
+			fmt.Fprintf(&sb, "s%d", n)
+		}
+	}
+	return sb.String()
 }
 
 func atoiSafe(s string) int {

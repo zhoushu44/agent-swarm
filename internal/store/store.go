@@ -41,6 +41,11 @@ const (
 	StatusSubmitted  = "submitted"
 	StatusDone       = "done"
 	StatusFailed     = "failed"
+	// StatusSplit means the item was decomposed into children. Its work now
+	// lives in those children, so it counts as terminal for progress: leaving
+	// it open froze seed progress at "2/4" on a run where all children had
+	// finished.
+	StatusSplit = "split"
 )
 
 // schema is idempotent and runs on every Open, so an existing database is

@@ -128,27 +128,37 @@ func scanItem(row rowScanner) (server.Item, error) {
 	return it, nil
 }
 
-// SeedProgress counts the SEED items (created_by = "seed") by terminal state.
+// SeedProgress counts the items the OPERATOR asked for, by terminal state.
 //
-// Used by --exit-when-done: the operator's own items are what "done" means.
-// Worker-created items and auto-split children are excluded, so a swarm that
-// keeps exploring after finishing its assignment still reports completion
-// promptly instead of never exiting.
+// "The operator asked for it" means created_by = 'seed' OR the item descends
+// from a seed item (an auto-split child of a seed item is still seed work —
+// its whole purpose is delivering the seed item). This matters: a run where
+// every seed item was split into children, and every child finished, must
+// report 4/4, not 2/4.
+//
+// Used by --exit-when-done, so a swarm that keeps exploring after finishing
+// its assignment still reports completion promptly instead of never exiting.
 func (s *Store) SeedProgress() (open, total int, err error) {
-	rows, err := s.db.Query(`SELECT status FROM items WHERE created_by = 'seed'`)
+	rows, err := s.db.Query(
+		`SELECT i.status, COALESCE(p.created_by, i.created_by) AS origin
+		 FROM items i
+		 LEFT JOIN items p ON p.id = i.parent_id`)
 	if err != nil {
 		return 0, 0, mapErr("seed progress", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var status string
-		if serr := rows.Scan(&status); serr != nil {
+		var status, origin string
+		if serr := rows.Scan(&status, &origin); serr != nil {
 			return 0, 0, mapErr("seed progress scan", serr)
+		}
+		if strings.TrimSpace(origin) != "seed" {
+			continue // bonus work: real output, but not what was asked for
 		}
 		total++
 		switch status {
-		case StatusDone, StatusFailed:
-			// terminal
+		case StatusDone, StatusFailed, StatusSplit:
+			// terminal (split = work handed to children)
 		default:
 			open++
 		}

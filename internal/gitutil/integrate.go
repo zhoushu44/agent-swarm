@@ -9,7 +9,14 @@ import (
 )
 
 // RejectedArtifacts returns file names that look like the scratch files the
-// gate refuses to merge: probe.*, tmp_*.*, debug_*.*, scratch/, *.log, *.tmp, *.bak.
+// gate refuses to merge: probe.*, tmp_*.*, debug_*.*, scratch/, *.log, *.tmp,
+// *.bak, and leading-underscore helpers (_grep.js, _read.js) that workers
+// write to make their own exploration easier.
+//
+// The underscore rule exists because a real run left scripts/_grep.js and
+// scripts/_read.js in a worktree: legitimate helper scripts for the worker,
+// but not deliverables, and they would otherwise land on the integration
+// branch as noise.
 func RejectedArtifacts(files []string) []string {
 	var bad []string
 	for _, f := range files {
@@ -18,7 +25,8 @@ func RejectedArtifacts(files []string) []string {
 		switch {
 		case strings.HasPrefix(base, "probe."),
 			strings.HasPrefix(base, "tmp_"),
-			strings.HasPrefix(base, "debug_"):
+			strings.HasPrefix(base, "debug_"),
+			strings.HasPrefix(base, "_"):
 			bad = append(bad, f)
 			continue
 		}

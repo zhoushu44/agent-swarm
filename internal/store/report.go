@@ -66,6 +66,13 @@ func (s *Store) BuildRunReport(startedAt time.Time, stopReason string, merged, r
 	if rows, _, err := s.ListItems("", 0, 0); err == nil {
 		all = rows
 	}
+	// Parent index for the lineage walk: id -> parent id.
+	parents := make(map[string]string, len(all))
+	for _, it := range all {
+		if it.ParentID != nil {
+			parents[it.ID] = strings.TrimSpace(*it.ParentID)
+		}
+	}
 	rep := RunReport{
 		StartedAt:  startedAt,
 		EndedAt:    time.Now(),
@@ -78,7 +85,9 @@ func (s *Store) BuildRunReport(startedAt time.Time, stopReason string, merged, r
 	}
 	for _, it := range all {
 		terminal := it.Status == StatusDone || it.Status == StatusFailed
-		if it.CreatedBy == "seed" {
+		// Seed work includes the seed items AND everything auto-split from
+		// them: those children exist to deliver the seed item.
+		if isSeedLineage(it, parents) {
 			switch {
 			case it.Status == StatusDone:
 				rep.SeedDone = append(rep.SeedDone, it)
@@ -97,6 +106,36 @@ func (s *Store) BuildRunReport(startedAt time.Time, stopReason string, merged, r
 	rep.StillOpen, _ = s.OpenItemSummary()
 	rep.TopSpend = rankSpend(spend, 8)
 	return rep
+}
+
+// isSeedLineage reports whether an item counts as "seed work": it was seeded,
+// or it descends from a seed item. An auto-split child of a seed item exists
+// to deliver that seed item, so it is still the operator's work — and its own
+// children are too.
+//
+// parents maps item id -> parent id for the whole board, so the walk is
+// O(depth) per item and needs no extra queries.
+func isSeedLineage(it server.Item, parents map[string]string) bool {
+	if strings.TrimSpace(it.CreatedBy) == "seed" {
+		return true
+	}
+	if it.ParentID == nil {
+		return false
+	}
+	seen := map[string]bool{}
+	cur := strings.TrimSpace(*it.ParentID)
+	for cur != "" && !seen[cur] {
+		seen[cur] = true
+		parent, ok := parents[cur]
+		if !ok {
+			return false
+		}
+		if strings.TrimSpace(parent) == "seed" {
+			return true
+		}
+		cur = parent
+	}
+	return false
 }
 
 // rankSpend sorts spend descending and caps it.

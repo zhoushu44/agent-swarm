@@ -79,6 +79,27 @@ func TestRejectedArtifacts(t *testing.T) {
 	}
 }
 
+// TestRejectedArtifactsIncludesUnderscoreHelpers: workers legitimately write
+// helper scripts to explore a codebase (observed on a real run:
+// scripts/_grep.js, scripts/_read.js). They are not deliverables, so they are
+// caught here — and cleaned before commit so they never cost a submission.
+func TestRejectedArtifactsIncludesUnderscoreHelpers(t *testing.T) {
+	got := RejectedArtifacts([]string{
+		"scripts/_grep.js",
+		"scripts/_read.js",
+		"_scratch.txt",
+		"tmp_test_out.txt",
+	})
+	want := []string{"_scratch.txt", "scripts/_grep.js", "scripts/_read.js", "tmp_test_out.txt"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("RejectedArtifacts = %v, want %v", got, want)
+	}
+	// A directory starting with _ is not the file's fault.
+	if extra := RejectedArtifacts([]string{"src/_internal/keep.js", "web/index.html"}); len(extra) != 0 {
+		t.Fatalf("expected no rejects, got %v", extra)
+	}
+}
+
 func TestWorkerNaming(t *testing.T) {
 	r := New(".")
 	if got, want := r.WorkerBranch("w1"), "swarm/swarm-w1"; got != want {
