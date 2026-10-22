@@ -128,6 +128,13 @@ type workerState struct {
 	reapFailCount    int
 	reapFailAt       time.Time
 	tokenUsage       workerUsage
+	// lastArtifact is the output fingerprint ("f3+120-8") from the most recent
+	// auto-commit. The empty-output breaker compares it across turns: three
+	// turns in a row with an unchanged (or empty) fingerprint means the model
+	// is talking, not working.
+	lastArtifact    string
+	prevArtifact    string
+	emptyArtifactAt time.Time
 }
 
 type itemHold struct {
@@ -545,6 +552,24 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			} else {
 				w.noProgressStreak = 0
 			}
+
+// Empty-output breaker: the fingerprint from the last auto-commit says
+// whether the turn produced anything. A static (or empty) fingerprint
+// across turns means the model is talking, not working — park it instead
+// of burning its whole token budget.
+if w.lastArtifact == "" || w.lastArtifact == w.prevArtifact {
+	if w.emptyArtifactAt.IsZero() {
+		w.emptyArtifactAt = time.Now()
+	}
+} else {
+	w.emptyArtifactAt = time.Time{}
+}
+w.prevArtifact = w.lastArtifact
+if !w.emptyArtifactAt.IsZero() && time.Since(w.emptyArtifactAt) > 3*time.Duration(r.cfg.maxItemTurns)*time.Second {
+	fmt.Fprintf(os.Stderr, "[swarm] %s parked: %d turns with no new output (fingerprint %q static)\n", w.name, 3, w.lastArtifact)
+	w.status = "crashed"
+	return
+}
 			// Item hold circuit breaker: abandon after maxItemTurns or maxItemTokens.
 			claims, _ := r.store.ActiveClaimsByPeer(w.name)
 r.mu.Lock()
@@ -699,7 +724,43 @@ func (r *swarmRunner) autoCommit(ctx context.Context, w *workerState) (string, e
 	if err != nil || !committed {
 		return "", err
 	}
+	// Output fingerprint: (files changed, lines added, lines removed) since
+	// the integration baseline. A worker whose fingerprint does not move is
+	// burning tokens without producing anything — the signature the progress
+	// line used to be blind to.
+	w.lastArtifact = r.artifactFingerprint(ctx, w.dir)
 	return sha, nil
+}
+
+// artifactFingerprint summarises what a worktree has actually produced. It
+// returns a compact string; an empty string means "nothing measurable".
+func (r *swarmRunner) artifactFingerprint(ctx context.Context, dir string) string {
+	out, err := r.repo.GitIn(ctx, dir, "diff", "--numstat", "HEAD")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return ""
+	}
+	files, add, del := 0, 0, 0
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		parts := strings.Split(line, "\t")
+		if len(parts) < 3 {
+			continue
+		}
+		files++
+		add += atoiSafe(parts[0])
+		del += atoiSafe(parts[1])
+	}
+	return fmt.Sprintf("f%d+%d-%d", files, add, del)
+}
+
+func atoiSafe(s string) int {
+	n := 0
+	for _, c := range strings.TrimSpace(s) {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 func (r *swarmRunner) itemTokens(itemID string) int {
