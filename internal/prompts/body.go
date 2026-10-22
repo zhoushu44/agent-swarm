@@ -46,15 +46,15 @@ Follow this loop, in order:
 3. EXECUTE
    - You are in a git worktree at your cwd; your changes are isolated. Write code, add tests, run them locally (you have full shell access).
    - BATCH your tool calls: whenever the next few actions are INDEPENDENT (writing multiple files, reading several files, running a command that does not depend on a file you are about to write), emit them ALL as parallel tool calls in ONE turn instead of one call per turn. The runtime executes same-round calls concurrently and feeds every result back together, so batching is pure speed. Only serialize when a later call genuinely needs an earlier call's output (e.g. test AFTER write). Example: to create src/a.js and src/b.js then test, emit write(a.js)+write(b.js) in one round, then bash(test) in the next.
-   - **Declare your intent BEFORE the first write**: POST {API}/context {peer:"{PEER}", kind:"INTENT", resource:"<path or path#symbol you are about to edit>", text:"editing X", itemId, ttlMs:900000}. This is how other workers know to route around you. One INTENT per resource; refresh with /renew if you keep going past the TTL.
-    - **Record the outcome AFTER you commit**: POST {API}/context {peer:"{PEER}", kind:"ACTION", resource:"<same token>", text:"what changed and why"}. ACTION marks are permanent ground truth — say what you did, not just "done".
+   - Optional: if you are about to spend several turns inside one file, POST {API}/context {peer:"{PEER}", kind:"INTENT", resource:"<path or path#symbol>", text:"editing X", itemId, ttlMs:900000} once so others route around you. Skip it for quick one-turn edits.
+    - **Record the outcome AFTER you commit**: POST {API}/context {peer:"{PEER}", kind:"ACTION", resource:"<path or path#symbol you edited>", text:"what changed and why"}. ACTION is permanent ground truth — always include the resource token. This is the single most valuable thing you can leave for other workers.
     - Commit your work with a clear message.
    - While working, publish useful knowledge:
      POST {API}/context {peer:"{PEER}", kind:"OBSERVED"|"FACT"|"FAIL", itemId, text, tags}
      - FAIL entries are gold: say exactly what you tried and why it failed so others skip the dead end.
    - Watch [PATCH_SUMMARY] entries in your TURN BRIEF / digest: the integrator publishes them after each successful merge, listing exactly which files just landed on the integration branch. Before editing a file, check recent PATCH_SUMMARYs — if another worker's change just touched the same file, re-read it first (your baseline may predate their edit) and adapt to it instead of blindly overwriting.
    - Also watch [CONFLICT] entries: they list HOT FILES that keep colliding across turns (others are actively changing them). Until a CONFLICT clears from your brief, avoid editing those files, or re-read the integration baseline right before you do — they are the most likely place your merge will fail.
-   - If your lease is about to expire (default 300s) and you're close: Before editing a file you did not claim an INTENT on, sniff it: GET {API}/marks?resource=<path>. Live marks there (WARNING = an earlier conclusion is stale, INTENT = someone is in it now) tell you whether to proceed, re-read, or pick something else.
+   - If your lease is about to expire (default 300s) and you're close: Before editing a file another worker may be inside, sniff it: GET {API}/marks?resource=<path>. Live marks there (ACTION = what already landed, WARNING = an earlier conclusion is stale) tell you whether to re-read or pick something else.
     - If your lease is about to expire (default 300s) and you are close: POST {API}/renew {token}
 
 4. VERIFY

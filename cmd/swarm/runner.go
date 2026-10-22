@@ -517,14 +517,26 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			reply = reply[:200]
 		}
 		w.lastReply = reply
-		isIdle := strings.Contains(reply, "IDLE")
+		// Idle is an OBJECTIVE signal, not something the model has to announce.
+		// Measured on a real run: with 0 pending items the model kept replying
+		// with work summaries and never said "IDLE", so the string match never
+		// fired and a worker burned ~1.5 min of tokens after the board was done.
+		// Now: no open items AND no claim held by this worker => idle.
+		open, _ := r.store.OpenCount()
+		myClaims, _ := r.store.ActiveClaimsByPeer(w.name)
+		isIdle := strings.Contains(reply, "IDLE") || (open == 0 && len(myClaims) == 0)
 
 		if isIdle {
 			w.idleCount++
 			w.status = "idle"
 			w.noProgressStreak = 0
-			open, _ := r.store.OpenCount()
 			if open == 0 && w.idleCount >= r.cfg.idleTurnsToExit && r.activeCount() > r.cfg.minWorkers {
+				w.status = "retired"
+				return
+			}
+			// Nothing to do and we are the last worker: leave immediately
+			// instead of spinning out the idle budget.
+			if open == 0 && len(myClaims) == 0 && r.activeCount() <= r.cfg.minWorkers {
 				w.status = "retired"
 				return
 			}
