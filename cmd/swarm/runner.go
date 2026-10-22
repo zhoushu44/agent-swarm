@@ -1383,19 +1383,55 @@ func (r *swarmRunner) presplitOversizedItems(dir string) int {
 
 func (r *swarmRunner) integratorLoop(ctx context.Context) {
 	defer r.wg.Done()
+	// Async gate: the MERGE stays serial (one git worktree, one index), but the
+	// GATE runs concurrently. This is the Amdahl fix — a merge cannot be
+	// parallelised, a test run can, and on a multi-worker board the serial gate
+	// was the throughput ceiling (each gate costs seconds, each merge costs
+	// milliseconds).
+	//
+	// Correctness: a gate failure rolls the integration branch back to that
+	// merge's From sha. Merges are serial and each records its From, so the
+	// rollback target is always well defined even with several gates in flight.
+	// A gate that fails while later merges already landed reverts those too;
+	// their submissions were already rejected and will be re-merged next round,
+	// so work is re-done, never lost.
+	gateSem := make(chan struct{}, 4)
+	var gateWG sync.WaitGroup
+	var inflight int
+
+	waitGates := func() {
+		gateWG.Wait()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
+			waitGates()
 			return
 		case <-r.stopCh:
+			waitGates()
 			return
 		case <-r.submitCh:
 			// event-driven wake
 		case <-time.After(200 * time.Millisecond):
 			// fallback poll
 		}
+
 		subs, err := r.store.QueuedSubmissions()
 		if err != nil || len(subs) == 0 {
+			if inflight == 0 {
+				continue
+			}
+			// Gates still running: wait for either shutdown or a short tick.
+			select {
+			case <-ctx.Done():
+				waitGates()
+				return
+			case <-r.stopCh:
+				waitGates()
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		}
 		// A submission is progress: keep the run alive even if the merge then
@@ -1403,81 +1439,118 @@ func (r *swarmRunner) integratorLoop(ctx context.Context) {
 		if r.onProgress != nil {
 			r.onProgress()
 		}
+
+		// ---- serial phase: merge each queued submission ----
 		for _, s := range subs {
 			select {
 			case <-r.stopCh:
+				waitGates()
+				return
+			case <-ctx.Done():
+				waitGates()
 				return
 			default:
 			}
-			r.integrateOne(ctx, s)
+
+			// Stale check: commit sha must still be on the branch.
+			if s.CommitSHA != "" {
+				anc, err := r.repo.Git(ctx, "merge-base", "--is-ancestor", s.CommitSHA, r.repo.WorkerBranch(s.Peer))
+				if err != nil || anc != "" {
+					r.rejectSubmission(s, fmt.Sprintf("stale submission: branch %s no longer contains submit sha %s",
+						r.repo.WorkerBranch(s.Peer), s.CommitSHA[:10]), "stale")
+					continue
+				}
+			}
+
+			res, merr := r.repo.MergeOnly(ctx, r.repo.WorkerBranch(s.Peer),
+				fmt.Sprintf("integrate %s (%s)", s.Peer, s.ItemID))
+			if merr != nil {
+				r.rejectSubmission(s, merr.Error(), "failed")
+				r.mu.Lock()
+				r.rejectedCount++
+				r.mu.Unlock()
+				r.logEvent(store.RunEvent{
+					Kind: store.EvMergeReject, Actor: "integrator", ItemID: s.ItemID,
+					Detail: "merge failed: " + firstLine(merr.Error()),
+				})
+				continue
+			}
+			if res.Noop || res.SHA == "" {
+				r.finishNoopOrReject(ctx, s, res)
+				continue
+			}
+
+			r.logEvent(store.RunEvent{
+				Kind: store.EvMerge, Actor: "integrator", ItemID: s.ItemID,
+				Detail: "merged " + shortSha(res.SHA) + arbitratedSuffix(res) +
+					fmt.Sprintf(" — %d files (gate running)", len(res.Files)),
+				Files: len(res.Files),
+			})
+
+			// ---- concurrent phase: gate this merge off the serial path ----
+			inflight++
+			gateWG.Add(1)
+			go func(s store.Submission, res *gitutil.MergeResult) {
+				defer gateWG.Done()
+				defer func() { inflight-- }()
+				gateSem <- struct{}{}
+				defer func() { <-gateSem }()
+
+				if gerr := r.repo.Gate(ctx); gerr == nil {
+					r.approveSubmission(s, res)
+					return
+				} else {
+					reason := gerr.Error()
+					if len(reason) > 400 {
+						reason = reason[:400]
+					}
+					// Revert this merge (and anything landed after it), then
+					// reject so a later round retries it.
+					if rbErr := r.repo.RollbackTo(ctx, res.From); rbErr != nil {
+						fmt.Fprintf(os.Stderr, "[swarm] rollback after gate failure failed: %v\n", rbErr)
+					}
+					r.rejectSubmission(s, reason, "failed")
+					r.mu.Lock()
+					r.rejectedCount++
+					r.mu.Unlock()
+					r.logEvent(store.RunEvent{
+						Kind: store.EvGate, Actor: "integrator", ItemID: s.ItemID,
+						Detail: "gate failed, rolled back to " + shortSha(res.From) + ": " + firstLine(reason),
+					})
+				}
+			}(s, res)
+		}
+
+		if inflight == 0 {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			waitGates()
+			return
+		case <-r.stopCh:
+			waitGates()
+			return
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
 
-func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
-	branch := r.repo.WorkerBranch(sub.Peer)
-	// Stale check: commit sha must still be on the branch.
-	if sub.CommitSHA != "" {
-		anc, err := r.repo.Git(ctx, "merge-base", "--is-ancestor", sub.CommitSHA, branch)
-		if err != nil || anc != "" {
-			reason := fmt.Sprintf("stale submission: branch %s no longer contains submit sha %s", branch, sub.CommitSHA[:10])
-			_ = r.store.ResolveSubmission(sub.ID, false, reason, r.cfg.maxItemFails)
-			_, _ = r.store.AddContext(server.ContextEntry{
-				Peer: sub.Peer, Kind: "FAIL",
-				Text:   fmt.Sprintf("integration rejected for item %s (stage=stale): %s", sub.ItemID, reason),
-				ItemID: &sub.ItemID, Tags: []string{"integration", "stale"},
-			})
-			return
-		}
+// arbitratedSuffix marks a merge that needed model arbitration.
+func arbitratedSuffix(res *gitutil.MergeResult) string {
+	if res != nil && res.Arbitrated {
+		return " (conflict resolved by model)"
 	}
+	return ""
+}
 
-	res, err := r.repo.Integrate(ctx, branch, fmt.Sprintf("integrate %s (%s)", sub.Peer, sub.ItemID))
-	if err != nil {
-		// Gate failed or conflict: reject with reason.
-		reason := err.Error()
-		if len(reason) > 400 {
-			reason = reason[:400]
-		}
-		_ = r.store.ResolveSubmission(sub.ID, false, reason, r.cfg.maxItemFails)
-		_, _ = r.store.AddContext(server.ContextEntry{
-			Peer: sub.Peer, Kind: "FAIL",
-			Text:   fmt.Sprintf("integration failed for item %s: %s", sub.ItemID, reason),
-			ItemID: &sub.ItemID, Tags: []string{"integration", "failed"},
-		})
-		r.mu.Lock()
-		r.rejectedCount++
-		r.mu.Unlock()
-		kind := store.EvMergeReject
-		if res != nil && res.Arbitrated {
-			kind = store.EvGate
-		}
-		r.logEvent(store.RunEvent{
-			Kind: kind, Actor: "integrator", ItemID: sub.ItemID,
-			Detail: "merge/gate failed: " + firstLine(reason),
-		})
-		return
-	}
-
-	// Noop check: submit sha must be in merged ancestry.
-	if sub.CommitSHA != "" && res.SHA != "" {
-		anc, err := r.repo.Git(ctx, "merge-base", "--is-ancestor", sub.CommitSHA, res.SHA)
-		if err != nil || anc != "" {
-			reason := fmt.Sprintf("no-op merge: submit sha %s not in merged %s ancestry", sub.CommitSHA[:10], res.SHA[:10])
-			_ = r.store.ResolveSubmission(sub.ID, false, reason, r.cfg.maxItemFails)
-			_, _ = r.store.AddContext(server.ContextEntry{
-				Peer: sub.Peer, Kind: "FAIL",
-				Text:   fmt.Sprintf("integration rejected for item %s (stage=no-op): %s", sub.ItemID, reason),
-				ItemID: &sub.ItemID, Tags: []string{"integration", "no-op"},
-			})
-			return
-		}
-	}
-
-	_ = r.store.ResolveSubmission(sub.ID, true, "", r.cfg.maxItemFails)
+// approveSubmission records a gated-green merge: resolve the submission, log
+// ITEM_DONE, and publish the patch summary other workers read.
+func (r *swarmRunner) approveSubmission(s store.Submission, res *gitutil.MergeResult) {
+	_ = r.store.ResolveSubmission(s.ID, true, "", r.cfg.maxItemFails)
 	r.mu.Lock()
 	r.mergedCount++
 	r.mu.Unlock()
-	// A merge is progress: keep the run alive.
 	if r.onProgress != nil {
 		r.onProgress()
 	}
@@ -1487,31 +1560,44 @@ func (r *swarmRunner) integrateOne(ctx context.Context, sub store.Submission) {
 			stat = stat[:1200]
 		}
 		_, _ = r.store.AddContext(server.ContextEntry{
-			Peer: sub.Peer, Kind: "PATCH_SUMMARY",
-			Text:   fmt.Sprintf("merged item %s into integration @%s:\n%s", sub.ItemID, res.SHA[:10], stat),
-			ItemID: &sub.ItemID, Tags: []string{"integration", "patch"},
+			Peer: s.Peer, Kind: "PATCH_SUMMARY",
+			Text:   fmt.Sprintf("merged item %s into integration @%s:\n%s", s.ItemID, shortSha(res.SHA), stat),
+			ItemID: &s.ItemID, Tags: []string{"integration", "patch"},
 		})
 	}
-	// Structured log: the durable record of what landed, and whether the
-	// merge needed arbitration.
-	detail := "merged " + shortSha(res.SHA)
-	if res.Arbitrated {
-		detail += " (conflict resolved by model)"
-	}
-	if len(res.Files) > 0 {
-		detail += fmt.Sprintf(" — %d files", len(res.Files))
-	}
 	r.logEvent(store.RunEvent{
-		Kind: store.EvMerge, Actor: "integrator", ItemID: sub.ItemID,
-		Detail: detail, Files: len(res.Files),
-	})
-	r.logEvent(store.RunEvent{
-		Kind: store.EvItemDone, Actor: sub.Peer, ItemID: sub.ItemID,
-		Detail: "integrated and gated green",
+		Kind: store.EvItemDone, Actor: s.Peer, ItemID: s.ItemID,
+		Detail: "integrated and gated green", Files: len(res.Files),
 	})
 }
 
-// firstLine returns the first line of a (possibly multi-line) error string.
+// rejectSubmission records a refused submission with the reason.
+func (r *swarmRunner) rejectSubmission(s store.Submission, reason, stage string) {
+	if len(reason) > 400 {
+		reason = reason[:400]
+	}
+	_ = r.store.ResolveSubmission(s.ID, false, reason, r.cfg.maxItemFails)
+	_, _ = r.store.AddContext(server.ContextEntry{
+		Peer: s.Peer, Kind: "FAIL",
+		Text:   fmt.Sprintf("integration rejected for item %s (stage=%s): %s", s.ItemID, stage, reason),
+		ItemID: &s.ItemID, Tags: []string{"integration", stage},
+	})
+}
+
+// finishNoopOrReject handles a merge that brought nothing new: it still has to
+// prove the submit sha is in the merged ancestry, or the submission is a no-op.
+func (r *swarmRunner) finishNoopOrReject(ctx context.Context, s store.Submission, res *gitutil.MergeResult) {
+	if s.CommitSHA != "" && res.SHA != "" {
+		anc, err := r.repo.Git(ctx, "merge-base", "--is-ancestor", s.CommitSHA, res.SHA)
+		if err != nil || anc != "" {
+			r.rejectSubmission(s, fmt.Sprintf("no-op merge: submit sha %s not in merged %s ancestry",
+				s.CommitSHA[:10], shortSha(res.SHA)), "no-op")
+			return
+		}
+	}
+	_ = r.store.ResolveSubmission(s.ID, true, "", r.cfg.maxItemFails)
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return strings.TrimSpace(s[:i])

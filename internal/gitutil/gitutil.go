@@ -197,7 +197,13 @@ func (r *Repo) BranchExists(ctx context.Context, branch string) bool {
 	return err == nil
 }
 
-// EnsureBranch creates branch pointing at base (HEAD when empty) if missing.
+// EnsureBranch creates branch at base (HEAD when empty) if missing. An existing
+// branch is left untouched — idempotent, which the async-gate path needs
+// because it can race a merge that already created the branch.
+//
+// "already exists" is treated as success: the check-then-create is not atomic,
+// so concurrent callers can both pass the check and both try to create. What
+// matters is that the branch exists afterwards, and it does.
 func (r *Repo) EnsureBranch(ctx context.Context, branch, base string) error {
 	if r.BranchExists(ctx, branch) {
 		return nil
@@ -205,8 +211,13 @@ func (r *Repo) EnsureBranch(ctx context.Context, branch, base string) error {
 	if strings.TrimSpace(base) == "" {
 		base = "HEAD"
 	}
-	_, err := r.Git(ctx, "branch", branch, base)
-	return err
+	if _, err := r.Git(ctx, "branch", branch, base); err != nil {
+		if r.BranchExists(ctx, branch) {
+			return nil // lost the race; the outcome is what we wanted
+		}
+		return err
+	}
+	return nil
 }
 
 // DeleteBranch force-deletes a local branch. Missing branches are ignored.

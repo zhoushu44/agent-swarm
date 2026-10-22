@@ -136,18 +136,36 @@ func (r *Repo) arbitrate(ctx context.Context, wt, from, branch string) error {
 }
 
 // Integrate merges branch into the integration branch and runs the gate.
-//
-// The merge happens in the worktree that has the integration branch checked
-// out (created at <repo>/.swarm/integration when needed). If the gate fails,
-// or the merge conflicts, the integration branch is reset back to its previous
-// tip so a failed submission never pollutes the shared baseline.
+// Serial convenience wrapper: MergeOnly + Gate + rollback on failure.
 func (r *Repo) Integrate(ctx context.Context, branch, message string) (*MergeResult, error) {
-	integration := r.Integration()
-	if !r.BranchExists(ctx, integration) {
-		if _, err := r.Git(ctx, "branch", integration, "HEAD"); err != nil {
-			return nil, fmt.Errorf("gitutil: create %s: %w", integration, err)
-		}
+	res, err := r.MergeOnly(ctx, branch, message)
+	if err != nil {
+		return res, err
 	}
+	if res.Noop || res.SHA == "" {
+		return res, nil
+	}
+	if gerr := r.Gate(ctx); gerr != nil {
+		_ = r.RollbackTo(ctx, res.From)
+		return res, gerr
+	}
+	return res, nil
+}
+
+// MergeOnly merges branch into the integration branch WITHOUT running the gate.
+//
+// This is the first half of the async-gate path: the merge itself must stay
+// serial (git semantics — one worktree, one index), but the gate does not. The
+// caller can merge a batch quickly and then run the gates concurrently; on
+// failure it calls RollbackTo with this result's From sha.
+//
+// On conflict the resolver is tried first (see ArbitrateConflicts); if that
+// fails the tree is rolled back to From before returning.
+func (r *Repo) MergeOnly(ctx context.Context, branch, message string) (*MergeResult, error) {
+	integration := r.Integration()
+	// Idempotent: concurrent callers may both see "missing" and both try to
+	// create it; the second one must not fail the merge.
+	_ = r.EnsureBranch(ctx, integration, "HEAD")
 	if !r.BranchExists(ctx, branch) {
 		return nil, fmt.Errorf("gitutil: branch %q does not exist", branch)
 	}
@@ -224,12 +242,40 @@ func (r *Repo) Integrate(ctx context.Context, branch, message string) (*MergeRes
 	if res.Files, err = r.ChangedFiles(ctx, from, merged); err != nil {
 		res.Files = nil
 	}
-
-	if err := r.RunGate(ctx, wt); err != nil {
-		r.rollback(ctx, wt, from)
-		return res, err
-	}
 	return res, nil
+}
+
+// Gate runs the gate command in the integration worktree.
+//
+// It ensures the worktree exists first: the async-gate path can call Gate
+// before any merge has created it (e.g. a queued submission whose merge was a
+// no-op), and chdir-ing into a missing directory fails with a confusing
+// "cannot find the path specified".
+func (r *Repo) Gate(ctx context.Context) error {
+	wt, err := r.integrationWorktree(ctx, r.Integration())
+	if err != nil {
+		return err
+	}
+	return r.RunGate(ctx, wt)
+}
+
+// RollbackTo resets the integration branch back to sha and cleans up. Used by
+// the async-gate path when a gate fails after the merge was already committed.
+func (r *Repo) RollbackTo(ctx context.Context, sha string) error {
+	wt := r.integrationDir()
+	if wt == "" {
+		return fmt.Errorf("gitutil: integration worktree not found")
+	}
+	r.rollback(ctx, wt, sha)
+	return nil
+}
+
+// integrationDir returns the integration worktree path (creating nothing).
+func (r *Repo) integrationDir() string {
+	if p := r.WorktreePath(context.Background(), r.Integration()); p != "" {
+		return p
+	}
+	return r.IntegrationPath()
 }
 
 // rollback hard-resets the integration worktree back to sha and cleans up.
@@ -241,16 +287,28 @@ func (r *Repo) rollback(ctx context.Context, wt, sha string) {
 
 // integrationWorktree returns a directory that has the integration branch
 // checked out, creating the worktree when it does not exist yet.
+//
+// Concurrent-safe: "already exists" from either `git branch` or
+// `git worktree add` is treated as success, because the outcome (the
+// worktree exists) is what the caller wanted. The async-gate path calls this
+// from several goroutines at once.
 func (r *Repo) integrationWorktree(ctx context.Context, integration string) (string, error) {
 	if wt := r.WorktreePath(ctx, integration); wt != "" {
 		return wt, nil
 	}
 	dir := r.IntegrationPath()
-	if err := r.EnsureBranch(ctx, integration, ""); err != nil {
-		return "", err
-	}
+	_ = r.EnsureBranch(ctx, integration, "")
 	if _, err := r.Git(ctx, "worktree", "add", dir, integration); err != nil {
+		// Either the worktree exists (another goroutine won the race, or a
+		// previous run left it) or the add genuinely failed. Re-check before
+		// deciding.
+		if wt := r.WorktreePath(ctx, integration); wt != "" {
+			return wt, nil
+		}
 		if _, err2 := r.Git(ctx, "worktree", "add", "--force", dir, integration); err2 != nil {
+			if wt := r.WorktreePath(ctx, integration); wt != "" {
+				return wt, nil
+			}
 			return "", fmt.Errorf("gitutil: add integration worktree %s: %w", dir, err)
 		}
 	}
