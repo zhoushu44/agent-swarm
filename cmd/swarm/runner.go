@@ -139,7 +139,7 @@ type swarmRunner struct {
 
 	// itemSpend attributes token spend per item so the maxItemTokens breaker
 	// and cost reporting work. Keyed by item id, guarded by mu.
-	itemSpend map[string]int64
+	itemSpend map[string]*itemLedger
 	// mergedCount / rejectedCount drive the run report's integration line.
 	mergedCount   int
 	rejectedCount int
@@ -197,6 +197,16 @@ type workerUsage struct {
 	inputTokens  int
 	outputTokens int
 	turns        int
+}
+
+// itemLedger is one item's cost so far. tokens drives the maxItemTokens
+// breaker; calls and turns are what the run report shows, and a ledger that
+// only tracked tokens left the report printing "3.75M tokens / 0 calls /
+// 0 turns" — technically true, useless in practice.
+type itemLedger struct {
+	tokens    int64
+	apiCalls  int
+	turnsHeld int
 }
 
 func newSwarmRunner(dir string, cfg runConfig, st *store.Store) (*swarmRunner, error) {
@@ -263,7 +273,7 @@ func newSwarmRunner(dir string, cfg runConfig, st *store.Store) (*swarmRunner, e
 		harness:    h,
 		workers:    make(map[string]*workerState),
 		itemHoldBy: make(map[string]string),
-		itemSpend:  make(map[string]int64),
+		itemSpend:  make(map[string]*itemLedger),
 		stopCh:     make(chan struct{}),
 		submitCh:   make(chan struct{}, 1),
 	}, nil
@@ -664,7 +674,14 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 			// reads a constant 0 and never fires.
 			if claims, cerr := r.store.ActiveClaimsByPeer(w.name); cerr == nil {
 				for _, c := range claims {
-					r.itemSpend[c.ItemID] += int64(result.Usage.TotalTokens)
+					led := r.itemSpend[c.ItemID]
+					if led == nil {
+						led = &itemLedger{}
+						r.itemSpend[c.ItemID] = led
+					}
+					led.tokens += int64(result.Usage.TotalTokens)
+					led.apiCalls += loopSteps
+					led.turnsHeld++
 				}
 			}
 			r.mu.Unlock()
@@ -1097,7 +1114,10 @@ func atoiSafe(s string) int {
 func (r *swarmRunner) itemTokens(itemID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return int(r.itemSpend[itemID])
+	if led := r.itemSpend[itemID]; led != nil {
+		return int(led.tokens)
+	}
+	return 0
 }
 
 // seedProgress reports how many SEED items are still open, out of the total.
@@ -1132,8 +1152,16 @@ func (r *swarmRunner) report(stopReason string) {
 	r.mu.Lock()
 	in, out, apiCalls := r.totalInputTokens, r.totalOutputTokens, r.totalAPICalls
 	spend := make([]store.ItemSpend, 0, len(r.itemSpend))
-	for id, tok := range r.itemSpend {
-		spend = append(spend, store.ItemSpend{ItemID: id, Tokens: tok})
+	for id, led := range r.itemSpend {
+		if led == nil {
+			continue
+		}
+		spend = append(spend, store.ItemSpend{
+			ItemID:    id,
+			Tokens:    led.tokens,
+			APICalls:  led.apiCalls,
+			TurnsHeld: led.turnsHeld,
+		})
 	}
 	merged, rejected := r.mergedCount, r.rejectedCount
 	r.mu.Unlock()
@@ -1144,13 +1172,15 @@ func (r *swarmRunner) report(stopReason string) {
 	fmt.Println("[swarm] " + rep.ResumeHint())
 }
 
-// itemSpendSnapshot returns the (item -> tokens) ledger for reporting.
-func (r *swarmRunner) itemSpendSnapshot() map[string]int64 {
+// itemSpendSnapshot returns a copy of the per-item ledger for reporting.
+func (r *swarmRunner) itemSpendSnapshot() map[string]itemLedger {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make(map[string]int64, len(r.itemSpend))
+	out := make(map[string]itemLedger, len(r.itemSpend))
 	for k, v := range r.itemSpend {
-		out[k] = v
+		if v != nil {
+			out[k] = *v
+		}
 	}
 	return out
 }

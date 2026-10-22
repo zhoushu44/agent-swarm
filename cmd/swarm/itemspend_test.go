@@ -12,7 +12,7 @@ func newTestRunner(t *testing.T) *swarmRunner {
 	return &swarmRunner{
 		workers:    make(map[string]*workerState),
 		itemHoldBy: make(map[string]string),
-		itemSpend:  make(map[string]int64),
+		itemSpend:  make(map[string]*itemLedger),
 		stopCh:     make(chan struct{}),
 		submitCh:   make(chan struct{}, 1),
 	}
@@ -28,20 +28,28 @@ func TestItemTokensStartsEmpty(t *testing.T) {
 }
 
 // TestItemSpendAccumulates: spend attributed to an item must survive the
-// worker accounting path (this is what makes maxItemTokens meaningful).
+// worker accounting path (this is what makes maxItemTokens meaningful), and
+// the ledger must carry calls/turns too — a report showing "3.75M tokens /
+// 0 calls / 0 turns" is technically true and practically useless.
 func TestItemSpendAccumulates(t *testing.T) {
 	r := newTestRunner(t)
 	r.mu.Lock()
-	r.itemSpend["it_1"] += 1200
-	r.itemSpend["it_1"] += 800
+	r.itemSpend["it_1"] = &itemLedger{tokens: 1200, apiCalls: 2, turnsHeld: 1}
+	r.itemSpend["it_1"].tokens += 800
+	r.itemSpend["it_1"].apiCalls += 1
+	r.itemSpend["it_1"].turnsHeld++
 	r.mu.Unlock()
 
 	if got := r.itemTokens("it_1"); got != 2000 {
 		t.Fatalf("item_1 spend = %d, want 2000", got)
 	}
-	// Snapshot must be a copy: mutating it must not affect the ledger.
 	snap := r.itemSpendSnapshot()
-	snap["it_1"] = 999999
+	led := snap["it_1"]
+	if led.tokens != 2000 || led.apiCalls != 3 || led.turnsHeld != 2 {
+		t.Fatalf("ledger = %+v, want tokens=2000 apiCalls=3 turnsHeld=2", led)
+	}
+	// Snapshot must be a copy: mutating it must not affect the ledger.
+	snap["it_1"] = itemLedger{tokens: 999999}
 	if got := r.itemTokens("it_1"); got != 2000 {
 		t.Fatalf("snapshot leaked into the ledger: %d", got)
 	}
