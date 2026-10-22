@@ -334,6 +334,97 @@ func TestOldRowsAndPlainContextStillWork(t *testing.T) {
 	}
 }
 
+// TestConflictsAcrossGranularities is the containment rule: a file-level
+// intent must warn a symbol-level claim, and vice versa. Exact-match IN (...)
+// silently missed both, which is the whole point of symbol-level parallelism.
+func TestConflictsAcrossGranularities(t *testing.T) {
+	st := openMarkStore(t)
+	base := st.clock()
+	st.SetClock(func() int64 { return base })
+
+	// w2 owns the WHOLE file.
+	if _, err := st.AddMark(server.ContextEntry{
+		Peer: "w2", Kind: "INTENT", Text: "rewriting the file",
+		Resource: "src/shared.js", TTLMs: 600000, TS: base,
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	// A worker about to touch one symbol inside it must be warned.
+	c, err := st.ConflictsFor([]string{"src/shared.js#fna"}, "w1")
+	if err != nil {
+		t.Fatalf("conflicts: %v", err)
+	}
+	if len(c) != 1 || c[0].Peer != "w2" {
+		t.Fatalf("file-level intent must warn the symbol worker, got %+v", c)
+	}
+
+	// And the reverse: a symbol-level intent warns a whole-file rewriter.
+	st2 := openMarkStore(t)
+	st2.SetClock(func() int64 { return base })
+	if _, err := st2.AddMark(server.ContextEntry{
+		Peer: "w3", Kind: "INTENT", Text: "editing one fn",
+		Resource: "src/shared.js#fnb", TTLMs: 600000, TS: base,
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	c2, err := st2.ConflictsFor([]string{"src/shared.js"}, "w1")
+	if err != nil {
+		t.Fatalf("conflicts: %v", err)
+	}
+	if len(c2) != 1 || c2[0].Peer != "w3" {
+		t.Fatalf("symbol intent must warn the file rewriter, got %+v", c2)
+	}
+
+	// Unrelated resources must NOT match (no false positives from prefixing).
+	c3, err := st.ConflictsFor([]string{"src/other.js", "src/shared.jsx"}, "w1")
+	if err != nil {
+		t.Fatalf("conflicts: %v", err)
+	}
+	if len(c3) != 0 {
+		t.Fatalf("unrelated resources must not conflict, got %+v", c3)
+	}
+
+	// A sibling symbol in the SAME file is a different resource and must not
+	// be reported: that is what makes symbol-level parallelism work.
+	st3 := openMarkStore(t)
+	st3.SetClock(func() int64 { return base })
+	if _, err := st3.AddMark(server.ContextEntry{
+		Peer: "w4", Kind: "INTENT", Text: "editing fna",
+		Resource: "src/shared.js#fna", TTLMs: 600000, TS: base,
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	c4, err := st3.ConflictsFor([]string{"src/shared.js#fnb"}, "w1")
+	if err != nil {
+		t.Fatalf("conflicts: %v", err)
+	}
+	if len(c4) != 0 {
+		t.Fatalf("sibling symbols must not conflict, got %+v", c4)
+	}
+}
+
+// TestMarksForContainment: sniffing a whole file must also surface symbol
+// marks inside it.
+func TestMarksForContainment(t *testing.T) {
+	st := openMarkStore(t)
+	base := st.clock()
+	st.SetClock(func() int64 { return base })
+	if _, err := st.AddMark(server.ContextEntry{
+		Peer: "w2", Kind: "WARNING", Text: "this fn is stale",
+		Resource: "src/shared.js#fna", TS: base,
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	got, err := st.MarksFor([]string{"src/shared.js"}, 10)
+	if err != nil {
+		t.Fatalf("marks for: %v", err)
+	}
+	if len(got) != 1 || got[0].Resource != "src/shared.js#fna" {
+		t.Fatalf("file query must surface the symbol mark, got %+v", got)
+	}
+}
+
 // TestItemResourcesExtractsPaths: the conflict scan is only as good as the
 // resource extraction.
 func TestItemResourcesExtractsPaths(t *testing.T) {

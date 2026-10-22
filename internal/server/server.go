@@ -121,14 +121,16 @@ type ClaimResult struct {
 
 // ConflictInfo describes one live intent on a contended resource.
 type ConflictInfo struct {
+	MarkID      int64  `json:"markId"`
 	Resource    string `json:"resource"`
 	Peer        string `json:"peer"`
 	ItemID      string `json:"itemId,omitempty"`
 	RemainingMs int64  `json:"remainingMs"`
 }
 
-// Conflict is the store-level shape of a live intent (server-facing alias so
-// the store package does not have to import server for its own result type).
+// Conflict is the store-facing alias so a store can satisfy MarkStore by exact
+// type. Structurally identical but nominally different types would fail the
+// interface assertion and silently disable the whole mark layer.
 type Conflict = ConflictInfo
 
 // CreateItemInput describes a new item.

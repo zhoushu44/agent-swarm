@@ -166,6 +166,10 @@ func (s *Store) ActiveMarks(resource string, limit int) ([]server.ContextEntry, 
 
 // MarksFor returns live marks on any of the given resources (batch form of
 // ActiveMarks). Used by the turn brief to pull only relevant traces.
+//
+// Like ConflictsFor, matching is containment: asking about "src/shared.js"
+// also returns marks on "src/shared.js#fnA" and vice versa, because both
+// granularities describe the same contended code.
 func (s *Store) MarksFor(resources []string, limit int) ([]server.ContextEntry, error) {
 	if err := s.migrateMarks(); err != nil {
 		return nil, err
@@ -177,11 +181,13 @@ func (s *Store) MarksFor(resources []string, limit int) ([]server.ContextEntry, 
 		limit = 100
 	}
 	now := s.clock()
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(resources)), ",")
-	// placeholder order: ttl_now, resource..., limit
+
+	var pred []string
 	args := []any{now}
 	for _, r := range resources {
-		args = append(args, r)
+		pred = append(pred, `(resource = ? OR resource LIKE ? ESCAPE '\' OR ? LIKE resource || '%' ESCAPE '\')`)
+		like := escapeLike(r)
+		args = append(args, r, like+"%", like+"%")
 	}
 	args = append(args, limit)
 
@@ -189,18 +195,34 @@ func (s *Store) MarksFor(resources []string, limit int) ([]server.ContextEntry, 
 		`SELECT `+eventColumns+`, COALESCE(mark_type,''), COALESCE(resource,''), COALESCE(ttl_ms,0)
 		 FROM events
 		 WHERE mark_type IS NOT NULL AND (ttl_ms IS NULL OR (ts + ttl_ms) > ?)
-		   AND resource IN (`+placeholders+`)
+		   AND (`+strings.Join(pred, " OR ")+`)
 		 ORDER BY id ASC LIMIT ?`, args...)
 	if err != nil {
 		return nil, mapErr("marks for", err)
 	}
 	defer rows.Close()
 
+	wanted := map[string]bool{}
+	for _, r := range resources {
+		wanted[strings.TrimSpace(r)] = true
+	}
 	out := []server.ContextEntry{}
 	for rows.Next() {
 		e, markType, res, ttlMs, serr := scanMarkRow(rows)
 		if serr != nil {
 			return nil, serr
+		}
+		// Same boundary check as ConflictsFor: the LIKE pre-filter cannot tell
+		// "src/a.js#fn" from "src/a.jsx", so Go decides precisely.
+		matched := false
+		for r := range wanted {
+			if resourceContains(r, res) || resourceContains(res, r) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
 		}
 		e.Kind = markType
 		e.Resource = res
@@ -211,16 +233,24 @@ func (s *Store) MarksFor(resources []string, limit int) ([]server.ContextEntry, 
 }
 
 // Conflict is one live intent held by another peer on a resource.
-type Conflict struct {
-	Resource   string `json:"resource"`
-	Peer       string `json:"peer"`
-	ItemID     string `json:"itemId,omitempty"`
-	MarkID     int64  `json:"markId"`
-	RemainingMs int64 `json:"remainingMs"`
-}
+// It aliases server.ConflictInfo so the store satisfies the server.MarkStore
+// interface by exact type — a structurally identical but distinct type would
+// fail the type assertion and silently disable /marks (501 at runtime, no
+// compile error). The assertion below turns that into a build failure.
+type Conflict = server.ConflictInfo
+
+// compile-time proof that Store implements the optional mark interface.
+var _ server.MarkStore = (*Store)(nil)
 
 // ConflictsFor lists live INTENT marks on the given resources, optionally
 // excluding the calling peer (a peer never conflicts with itself).
+//
+// Matching is containment, not equality: a mark on "src/shared.js" conflicts
+// with a query for "src/shared.js#fnA" (the whole file is claimed, so the
+// symbol inside it is contended), and a mark on "src/shared.js#fnA" conflicts
+// with a query for "src/shared.js" (someone is editing a symbol of the file
+// you want to rewrite). Exact matches are a subset of both directions.
+//
 // Returned by Claim so the worker learns "w3 is editing src/foo.js#fn"
 // without any central scheduler making the call for it.
 func (s *Store) ConflictsFor(resources []string, excludePeer string) ([]Conflict, error) {
@@ -231,42 +261,61 @@ func (s *Store) ConflictsFor(resources []string, excludePeer string) ([]Conflict
 		return nil, nil
 	}
 	now := s.clock()
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(resources)), ",")
-	// placeholder order: mark_type, ttl_now, resource..., [peer]
+
+	// Build a coarse containment predicate. SQL pre-filters with LIKE so we do
+	// not scan the whole table; the exact boundary check (a symbol suffix, not
+	// "src/a.jsx" vs "src/a.js") happens in Go below via resourceContains.
+	var pred []string
 	args := []any{MarkIntent, now}
 	for _, r := range resources {
-		args = append(args, r)
+		pred = append(pred, `(resource = ? OR resource LIKE ? ESCAPE '\' OR ? LIKE resource || '%' ESCAPE '\')`)
+		like := escapeLike(r)
+		args = append(args, r, like+"%", like+"%")
 	}
+	where := strings.Join(pred, " OR ")
 	if p := strings.TrimSpace(excludePeer); p != "" {
+		where = "(" + where + ") AND peer != ?"
 		args = append(args, p)
 	}
 
-	exclude := ""
-	if strings.TrimSpace(excludePeer) != "" {
-		exclude = ` AND peer != ?`
-	}
 	rows, err := s.db.Query(
 		`SELECT id, peer, COALESCE(item_id,''), resource, ts, COALESCE(ttl_ms,0)
 		 FROM events
 		 WHERE mark_type = ?
 		   AND (ttl_ms IS NULL OR (ts + ttl_ms) > ?)
-		   AND resource IN (`+placeholders+`)`+exclude+`
+		   AND (`+where+`)
 		 ORDER BY id ASC`, args...)
 	if err != nil {
 		return nil, mapErr("conflicts for", err)
 	}
 	defer rows.Close()
 
+	wanted := map[string]bool{}
+	for _, r := range resources {
+		wanted[strings.TrimSpace(r)] = true
+	}
 	out := []Conflict{}
 	for rows.Next() {
 		var (
-			c        Conflict
-			itemID   sql.NullString
-			ts       int64
-			ttlMs    int64
+			c      Conflict
+			itemID sql.NullString
+			ts     int64
+			ttlMs  int64
 		)
 		if serr := rows.Scan(&c.MarkID, &c.Peer, &itemID, &c.Resource, &ts, &ttlMs); serr != nil {
 			return nil, mapErr("conflicts for scan", serr)
+		}
+		// Exact boundary check: the SQL LIKE pre-filter is deliberately loose
+		// (it cannot distinguish "src/a.js#fn" from "src/a.jsx").
+		matched := false
+		for r := range wanted {
+			if resourceContains(r, c.Resource) || resourceContains(c.Resource, r) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
 		}
 		c.ItemID = itemID.String
 		if ttlMs > 0 {
@@ -324,6 +373,28 @@ func (s *Store) ReapExpiredMarks() (int, error) {
 		return 0, mapErr("reap expired marks rows", err)
 	}
 	return int(n), nil
+}
+
+// resourceContains reports whether inner is contained in outer at a resource
+// boundary: "src/a.js#fn" is inside "src/a.js", and "src/a.js" contains it,
+// but "src/a.jsx" is NOT inside "src/a.js" (different file). The separator is
+// '#' — a symbol suffix — so plain string prefixing is not enough.
+func resourceContains(outer, inner string) bool {
+	if outer == inner {
+		return true
+	}
+	if !strings.HasPrefix(inner, outer) {
+		return false
+	}
+	rest := inner[len(outer):]
+	// only a symbol qualifier may follow the outer resource
+	return strings.HasPrefix(rest, "#")
+}
+
+// escapeLike escapes SQL LIKE wildcards so a path is matched literally.
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // scanMarkRow reads one mark row: the canonical event columns plus the three
