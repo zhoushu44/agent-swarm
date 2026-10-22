@@ -1185,6 +1185,49 @@ func (r *swarmRunner) itemSpendSnapshot() map[string]itemLedger {
 	return out
 }
 
+// realResources keeps only the resource tokens that name a file git actually
+// tracks.
+//
+// Resource extraction is a regex over free text, so it happily produces
+// "chat.js" from a sentence mentioning chat.js, or "openai/http.js" from
+// "the openai/http.js layer" when the real path is src/openai/http.js. Those
+// are not files. Splitting an item along them creates children nobody can
+// open — measured on dola: 15 open items, 4 of them phantom paths, each one
+// burning a worker that could not find the file.
+//
+// A symbol-qualified token ("src/a.js#fn") is kept when its file part is
+// tracked. Untracked-but-plausible new files are dropped: a split should
+// distribute work that exists, not invent files.
+func (r *swarmRunner) realResources(dir string, candidates []string) []string {
+	if len(candidates) == 0 {
+		return nil
+	}
+	out, err := r.repo.GitIn(context.Background(), dir, "ls-files")
+	if err != nil {
+		// Without the index we cannot tell real from phantom: keep the
+		// candidates rather than silently refusing to split.
+		return candidates
+	}
+	tracked := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		p := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(line, `\`, "/")))
+		if p != "" {
+			tracked[p] = true
+		}
+	}
+	var kept []string
+	for _, c := range candidates {
+		file := c
+		if h := strings.IndexByte(file, '#'); h >= 0 {
+			file = file[:h]
+		}
+		if tracked[strings.ToLower(file)] {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
 func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
 	item, err := r.store.GetItem(itemID)
 	if err != nil {
@@ -1202,7 +1245,7 @@ func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
 	// exactly ONE resource token (path or path#symbol) so the stigmergy
 	// conflict scan can keep them apart. A child that names nothing concrete
 	// is worse than no split — it becomes an unfinishable god task.
-	resources := store.ResourcesOf(item)
+	resources := r.realResources(w.dir, store.ResourcesOf(item))
 	if len(resources) <= 1 {
 		// Nothing to split along: leave it for a stronger model / a human.
 		return
