@@ -101,12 +101,82 @@ func (s *Store) Claim(itemID, peer string) (server.ClaimResult, error) {
 		return server.ClaimResult{}, mapErr("claim", err)
 	}
 
+	// Stigmergy feedback: tell the worker who else is already editing the
+	// resources this item names. Read after the transaction so a slow mark
+	// scan never holds the claim lock.
+	conflicts := s.conflictsForItem(it, peer)
+
 	it.Status = StatusInProgress
 	return server.ClaimResult{
-		Token:   token,
-		Item:    it,
-		History: history,
+		Token:     token,
+		Item:      it,
+		History:   history,
+		Conflicts: conflicts,
 	}, nil
+}
+
+// conflictsForItem extracts resource tokens from the item's title + detail
+// and reports live intents held by other peers on them.
+//
+// Resource granularity is "path" or "path#symbol" (the same token the
+// item-level dedup key uses), so a worker editing
+// "src/dola/video.js#pollVideo" does not collide with one editing
+// "src/dola/video.js#buildVideoBody".
+func (s *Store) conflictsForItem(it server.Item, excludePeer string) []server.ConflictInfo {
+	resources := itemResources(it)
+	if len(resources) == 0 {
+		return nil
+	}
+	found, err := s.ConflictsFor(resources, excludePeer)
+	if err != nil || len(found) == 0 {
+		return nil
+	}
+	out := make([]server.ConflictInfo, 0, len(found))
+	for _, c := range found {
+		out = append(out, server.ConflictInfo{
+			Resource:    c.Resource,
+			Peer:        c.Peer,
+			ItemID:      c.ItemID,
+			RemainingMs: c.RemainingMs,
+		})
+	}
+	return out
+}
+
+// ResourcesOf returns the resource tokens (path or path#symbol) an item names,
+// lowercased. Exported so the runner can split items along resource
+// boundaries while the extraction logic stays in one place.
+func ResourcesOf(it server.Item) []string {
+	return itemResources(it)
+}
+
+// itemResources pulls resource tokens (path or path#symbol) out of an item's
+// title and detail, lowercased for stable matching. resourceRE and the
+// "#symbol" granularity live in items.go so the dedup key and the conflict
+// scan always agree.
+func itemResources(it server.Item) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(text string) {
+		for _, m := range resourceRE.FindAllString(text, -1) {
+			n := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(m, `\`, `/`), `./`))
+			// strip trailing punctuation the regex may have swallowed
+			n = strings.TrimRight(n, ".,;:)")
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	add(it.Title)
+	add(it.Detail)
+	// Cap: an item naming 40 files should not trigger a 40-way conflict scan
+	// on every claim.
+	if len(out) > 12 {
+		out = out[:12]
+	}
+	return out
 }
 
 // Release drops a claim and puts the item back on the board as pending.
@@ -121,8 +191,8 @@ func (s *Store) Release(token string) error {
 	}
 	defer tx.Rollback()
 
-	var itemID string
-	if err := tx.QueryRow(`SELECT item_id FROM claims WHERE token = ?`, token).Scan(&itemID); err != nil {
+	var itemID, peer string
+	if err := tx.QueryRow(`SELECT item_id, peer FROM claims WHERE token = ?`, token).Scan(&itemID, &peer); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return notFound("release claim", token)
 		}
@@ -135,7 +205,13 @@ func (s *Store) Release(token string) error {
 		StatusPending, itemID, StatusInProgress); err != nil {
 		return mapErr("release", err)
 	}
-	return mapErr("release", tx.Commit())
+	if err := tx.Commit(); err != nil {
+		return mapErr("release", err)
+	}
+	// Drop the worker's stigmergy traces: a released claim must not keep
+	// pinning resources other workers could pick up.
+	_, _ = s.ReleaseMarks(peer)
+	return nil
 }
 
 // Renew extends a live claim's lease by one lease period.
@@ -211,6 +287,9 @@ func (s *Store) Submit(token, peer, commitSha string) (server.Item, error) {
 	if err := tx.Commit(); err != nil {
 		return server.Item{}, mapErr("submit", err)
 	}
+	// The work is handed to the integrator: drop this peer's intent marks so
+	// the resources stop looking contended.
+	_, _ = s.ReleaseMarks(peer)
 	return it, nil
 }
 
@@ -224,15 +303,15 @@ func (s *Store) ReapExpired() (int, error) {
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT token, item_id FROM claims WHERE expires_at <= ?`, now)
+	rows, err := tx.Query(`SELECT token, item_id, peer FROM claims WHERE expires_at <= ?`, now)
 	if err != nil {
 		return 0, mapErr("reap", err)
 	}
-	type dead struct{ token, itemID string }
+	type dead struct{ token, itemID, peer string }
 	var expired []dead
 	for rows.Next() {
 		var d dead
-		if err := rows.Scan(&d.token, &d.itemID); err != nil {
+		if err := rows.Scan(&d.token, &d.itemID, &d.peer); err != nil {
 			rows.Close()
 			return 0, mapErr("reap", err)
 		}
@@ -243,6 +322,7 @@ func (s *Store) ReapExpired() (int, error) {
 		return 0, mapErr("reap", err)
 	}
 
+	reapedPeers := map[string]bool{}
 	for _, d := range expired {
 		if _, err := tx.Exec(`DELETE FROM claims WHERE token = ?`, d.token); err != nil {
 			return 0, mapErr("reap", err)
@@ -251,10 +331,20 @@ func (s *Store) ReapExpired() (int, error) {
 			StatusPending, d.itemID, StatusInProgress); err != nil {
 			return 0, mapErr("reap", err)
 		}
+		if p := strings.TrimSpace(d.peer); p != "" {
+			reapedPeers[p] = true
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, mapErr("reap", err)
 	}
+	// A worker whose lease elapsed is gone: its intent marks must not keep
+	// pinning resources.
+	for p := range reapedPeers {
+		_, _ = s.ReleaseMarks(p)
+	}
+	// Belt and braces: clear any intent whose TTL elapsed on its own.
+	_, _ = s.ReapExpiredMarks()
 	return len(expired), nil
 }
 

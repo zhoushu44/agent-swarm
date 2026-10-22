@@ -165,13 +165,20 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleContext serves POST /context (publish shared knowledge).
+//
+// When Kind is a stigmergy mark (INTENT/ACTION/OBSERVATION/WARNING/NEED) the
+// request may carry resource ("src/foo.js" or "src/foo.js#fn") and ttlMs.
+// Mark writes go through AddMark so an unknown type is rejected instead of
+// silently becoming an ordinary note.
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Peer   string   `json:"peer"`
-		Kind   string   `json:"kind"`
-		Text   string   `json:"text"`
-		ItemID *string  `json:"itemId"`
-		Tags   []string `json:"tags"`
+		Peer     string   `json:"peer"`
+		Kind     string   `json:"kind"`
+		Text     string   `json:"text"`
+		ItemID   *string  `json:"itemId"`
+		Tags     []string `json:"tags"`
+		Resource string   `json:"resource"`
+		TTLMs    int64    `json:"ttlMs"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -183,19 +190,70 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(in.Kind) == "" {
 		in.Kind = "OBSERVED"
 	}
-	entry, err := s.store.AddContext(ContextEntry{
-		Peer:   strings.TrimSpace(in.Peer),
-		Kind:   strings.ToUpper(strings.TrimSpace(in.Kind)),
-		Text:   in.Text,
-		ItemID: in.ItemID,
-		Tags:   in.Tags,
-		TS:     s.now(),
-	})
+	entry := ContextEntry{
+		Peer:     strings.TrimSpace(in.Peer),
+		Kind:     strings.ToUpper(strings.TrimSpace(in.Kind)),
+		Text:     in.Text,
+		ItemID:   in.ItemID,
+		Tags:     in.Tags,
+		TS:       s.now(),
+		Resource: strings.TrimSpace(in.Resource),
+		TTLMs:    in.TTLMs,
+	}
+	var out ContextEntry
+	var err error
+	if ms, ok := s.store.(MarkStore); ok && isMarkKind(entry.Kind) {
+		out, err = ms.AddMark(entry)
+	} else {
+		out, err = s.store.AddContext(entry)
+	}
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, entry)
+	writeJSON(w, http.StatusOK, out)
+}
+
+// MarkStore is the optional stigmergy interface a store may implement.
+type MarkStore interface {
+	AddMark(entry ContextEntry) (ContextEntry, error)
+	ActiveMarks(resource string, limit int) ([]ContextEntry, error)
+	MarksFor(resources []string, limit int) ([]ContextEntry, error)
+	ConflictsFor(resources []string, excludePeer string) ([]Conflict, error)
+	ReleaseMarks(peer string) (int, error)
+}
+
+// isMarkKind reports whether kind is one of the five protocol marks.
+func isMarkKind(kind string) bool {
+	switch strings.ToUpper(strings.TrimSpace(kind)) {
+	case "INTENT", "ACTION", "OBSERVATION", "WARNING", "NEED":
+		return true
+	}
+	return false
+}
+
+// handleMarks serves GET /marks?resource=&peer=&limit= — live traces on a
+// resource (or all of them when resource is empty). This is how a worker
+// "sniffs" the environment before touching a file.
+func (s *Server) handleMarks(w http.ResponseWriter, r *http.Request) {
+	ms, ok := s.store.(MarkStore)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "mark store not available")
+		return
+	}
+	q := r.URL.Query()
+	resource := strings.TrimSpace(q.Get("resource"))
+	limit := atoiDefault(q.Get("limit"), 50)
+	marks, err := ms.ActiveMarks(resource, limit)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resource": resource,
+		"count":    len(marks),
+		"marks":    marks,
+	})
 }
 
 // handleSearch serves GET /context/search?q=&limit=.

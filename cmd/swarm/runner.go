@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -689,23 +688,32 @@ func (r *swarmRunner) autoSplitItem(w *workerState, itemID string) {
 	}
 	total, _ := r.store.ItemCount()
 	depth, _ := r.store.ItemDepth(itemID)
-	if total >= r.cfg.maxItems || depth >= 4 {
+	// Depth 2, not 4: a third-level split produced titles like
+	// "06-openai-chat-endpoint (tests) (core impl) (core impl) (core impl)"
+	// in practice, and those children all edit the same file.
+	if total >= r.cfg.maxItems || depth >= 2 {
 		return
 	}
-	base := strings.TrimSuffix(item.Title, filepath.Ext(item.Title))
+	// Split by resource, not by "core impl" / "tests": every child must name
+	// exactly ONE resource token (path or path#symbol) so the stigmergy
+	// conflict scan can keep them apart. A child that names nothing concrete
+	// is worse than no split — it becomes an unfinishable god task.
+	resources := store.ResourcesOf(item)
+	if len(resources) <= 1 {
+		// Nothing to split along: leave it for a stronger model / a human.
+		return
+	}
 	_ = r.store.SetStatus(itemID, "split")
-	_, err1 := r.store.CreateItem(server.CreateItemInput{
-		Peer: "auto-split", Title: base + " — core implementation",
-		Detail:   "Split from \"" + item.Title + "\" — core implementation only, no tests. " + item.Detail,
-		ParentID: &itemID, Kind: "task",
-	})
-	_, err2 := r.store.CreateItem(server.CreateItemInput{
-		Peer: "auto-split", Title: base + " — tests",
-		Detail:   "Split from \"" + item.Title + "\" — tests only, assumes core impl exists. " + item.Detail,
-		ParentID: &itemID, Kind: "task",
-	})
-	if err1 != nil || err2 != nil {
-		_ = r.store.SetStatus(itemID, "pending")
+	for _, res := range resources {
+		_, _ = r.store.CreateItem(server.CreateItemInput{
+			Peer: "auto-split",
+			// Bare resource token as the title: no verbs, no parentheticals.
+			// This is what makes N workers agree on the same sub-item.
+			Title: res,
+			Detail: fmt.Sprintf("Split from %q — deliver %s only. %s", item.Title, res, item.Detail),
+			ParentID: &itemID,
+			Kind:     "task",
+		})
 	}
 }
 

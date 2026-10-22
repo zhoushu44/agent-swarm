@@ -9,20 +9,28 @@ import (
 	"swarm-go/internal/server"
 )
 
-// artifactRE pulls file-path tokens (anything with an extension) out of an
-// item title. Mirrors the JS ARTIFACT_RE in store.js: two workers asked to
-// "add src/util/compact.js" and "create src/util/compact.js with tests" are
-// delivering the SAME artifact, but an exact-title dedup lets both through
-// and they collide on add/add at merge time. Folding by the extracted file
-// path collapses every phrasing of the same deliverable into one item.
+// resourceRE pulls resource tokens (path, optionally "#symbol") out of a
+// title. It is the single source of truth shared by the item dedup key and
+// the stigmergy conflict scan, so both agree on granularity.
+//
+// The optional "#symbol" suffix is what makes symbol-level tasks possible:
+// "implement src/util/compact.js#compress" and
+// "test src/util/compact.js#compress" are two items that BOTH touch the same
+// symbol (so they conflict), while
+// "implement src/util/compact.js#compress" and
+// "implement src/util/compact.js#decompress" are two items that do NOT
+// conflict — and, crucially, are no longer folded into one item by dedup.
+var resourceRE = regexp.MustCompile(`[A-Za-z0-9_@.\/\\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?:#[A-Za-z_][A-Za-z0-9_]*)?`)
+
+// artifactRE is kept as the file-only view (no "#symbol") for callers that
+// want whole-file folding. Dedup uses resourceRE so symbol-level items stay
+// separate.
 var artifactRE = regexp.MustCompile(`[A-Za-z0-9_@.\/\\-]+\.[A-Za-z][A-Za-z0-9]{0,5}\b`)
 
-// artifactKey returns the normalized dedup key for a title: "f:<path>" when
-// the title names at least one file (paths lowercased, backslashes → slashes,
-// leading ./ stripped, sorted+joined), else "" (caller falls back to exact
-// title match).
+// artifactKey returns the normalized dedup key for a title: "f:<resource>"
+// (resource = path or path#symbol, lowercased, sorted+joined), else "".
 func artifactKey(title string) string {
-	hits := artifactRE.FindAllString(title, -1)
+	hits := resourceRE.FindAllString(title, -1)
 	if len(hits) == 0 {
 		return ""
 	}
@@ -30,6 +38,7 @@ func artifactKey(title string) string {
 	var uniq []string
 	for _, h := range hits {
 		n := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(h, `\`, `/`), `./`))
+		n = strings.TrimRight(n, ".,;:)")
 		if !seen[n] {
 			seen[n] = true
 			uniq = append(uniq, n)

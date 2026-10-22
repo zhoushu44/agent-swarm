@@ -52,14 +52,21 @@ type Item struct {
 }
 
 // ContextEntry is a shared-memory note (FACT / OBSERVED / FAIL / PATCH_SUMMARY ...).
+//
+// When Kind is one of the stigmergy marks (INTENT / ACTION / OBSERVATION /
+// WARNING / NEED), Resource names what the trace is about — a file path, or
+// "path#symbol" for symbol-level granularity. TTLMs > 0 makes the trace
+// expire (intents); 0 means permanent (actions, needs).
 type ContextEntry struct {
-	ID     int64    `json:"id,omitempty"`
-	Peer   string   `json:"peer"`
-	Kind   string   `json:"kind"`
-	Text   string   `json:"text"`
-	ItemID *string  `json:"itemId,omitempty"`
-	Tags   []string `json:"tags,omitempty"`
-	TS     int64    `json:"ts"`
+	ID       int64    `json:"id,omitempty"`
+	Peer     string   `json:"peer"`
+	Kind     string   `json:"kind"`
+	Text     string   `json:"text"`
+	ItemID   *string  `json:"itemId,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	TS       int64    `json:"ts"`
+	Resource string   `json:"resource,omitempty"`
+	TTLMs    int64    `json:"ttlMs,omitempty"`
 }
 
 // Claim is an active lease held by a peer.
@@ -101,11 +108,28 @@ type Digest struct {
 }
 
 // ClaimResult is the task package handed back by POST /claim.
+//
+// Conflicts carries live INTENT marks held by OTHER peers on the resources
+// this item touches. The worker decides for itself whether to proceed, work
+// around, or pick a different item — no scheduler makes that call.
 type ClaimResult struct {
-	Token   string         `json:"token"`
-	Item    Item           `json:"item"`
-	History []ContextEntry `json:"history"`
+	Token     string         `json:"token"`
+	Item      Item           `json:"item"`
+	History   []ContextEntry `json:"history"`
+	Conflicts []ConflictInfo `json:"conflicts,omitempty"`
 }
+
+// ConflictInfo describes one live intent on a contended resource.
+type ConflictInfo struct {
+	Resource    string `json:"resource"`
+	Peer        string `json:"peer"`
+	ItemID      string `json:"itemId,omitempty"`
+	RemainingMs int64  `json:"remainingMs"`
+}
+
+// Conflict is the store-level shape of a live intent (server-facing alias so
+// the store package does not have to import server for its own result type).
+type Conflict = ConflictInfo
 
 // CreateItemInput describes a new item.
 type CreateItemInput struct {
@@ -170,6 +194,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/digest", s.only("GET", s.handleDigest))
 	s.mux.HandleFunc("/context", s.only("POST", s.handleContext))
 	s.mux.HandleFunc("/context/search", s.only("GET", s.handleSearch))
+	s.mux.HandleFunc("/marks", s.only("GET", s.handleMarks))
 	s.mux.HandleFunc("/messages", s.only("GET", s.handleMessages))
 	s.mux.HandleFunc("/message", s.only("POST", s.handleMessage))
 	s.mux.HandleFunc("/claim", s.only("POST", s.handleClaim))
