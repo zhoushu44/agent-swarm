@@ -2,6 +2,48 @@
 
 Go port of the [agent-swarm](../swarm) multi-agent parallel dev orchestrator. Workers claim items off a SQLite-backed board, drive an LLM through a 4-tool agent loop (bash / write / http / finish), and an integrator merges their worktrees.
 
+## Quick start
+
+```bash
+swarm seed <dir> --file seed.json     # seed work items
+swarm run  <dir>                      # just run it — the guards below are ON by default
+swarm status <dir>                    # board + "seed work: N/M terminal"
+swarm log   <dir>                     # what happened, as structured events
+```
+
+### Defaults that are already ON
+
+These ship enabled because a run without them is unpredictable. Each one was
+added after a real run demonstrated the failure.
+
+| Default | Value | Why |
+|---|---|---|
+| `--exit-when-done` | on | "Done" = **the items you seeded** reached a terminal state. Not "board empty" — workers keep inventing useful work, so an empty board never happens. |
+| `--max-wall-clock` | 30m | Hard ceiling for the whole run. Every other breaker is per-turn or per-output, so a worker that makes a tiny diff every turn never trips any of them (measured: one worker held an item 12 min while the rest finished in 5). |
+| `--max-item-seconds` | 300 | A worker holding one item longer than this releases it back to the pool, with a FAIL note so the next worker does not repeat the dead end. |
+
+Override or disable explicitly:
+
+```bash
+swarm run <dir> --max-wall-clock 2h     # longer ceiling
+swarm run <dir> --max-wall-clock 0      # no ceiling (not recommended)
+swarm run <dir> --no-exit-when-done     # wait for a completely empty board
+swarm run <dir> --max-item-seconds 900  # give stuck items more room
+```
+
+### Interrupting and resuming
+
+Stopping a run (Ctrl-C, wall-clock, or seed-done) loses nothing:
+
+- finished items are **not re-claimable** — a second run with the same seed does
+  not redo them
+- open items resume where they were
+- everything that passed the gate stays on the `integration` branch
+
+So a 50-minute job split across three runs costs three runs' worth of work,
+not 3× the work. The end-of-run report says exactly which items are in which
+state, and `swarm log <dir>` gives the per-event trail.
+
 ## Autoscaler: the worker pool is elastic, not fixed
 
 The single most important behavior for long-running jobs: **the worker count is not fixed at `--workers`**. An autoscaler loop (`autoscalerLoop`, 1s tick) continuously grows and shrinks the pool between `--workers` (floor) and `--max-workers` (ceiling, default 1000).

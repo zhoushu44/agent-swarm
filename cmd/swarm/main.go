@@ -134,13 +134,16 @@ func main() {
 				sw(&cfg.testCmd)
 			case "--exit-when-done":
 				cfg.exitWhenDone = true
-				cfg.minWorkers = 0 // mirror JS: exit-when-done drops the idle-retire floor so the last worker can leave
+			case "--no-exit-when-done":
+				cfg.exitWhenDone = false
 			case "--no-create":
 				cfg.noCreate = true
 			case "--max-wall-clock":
-				// accepts "20m", "90s", "1h30m"; 0 disables
+				// accepts "20m", "90s", "1h30m"; "0" disables the ceiling
 				if i+1 < len(args) {
-					if d, derr := time.ParseDuration(args[i+1]); derr == nil {
+					if args[i+1] == "0" {
+						cfg.maxWallClock = 0
+					} else if d, derr := time.ParseDuration(args[i+1]); derr == nil {
 						cfg.maxWallClock = d
 					} else {
 						fmt.Fprintf(os.Stderr, "run: --max-wall-clock %q: %v\n", args[i+1], derr)
@@ -150,6 +153,13 @@ func main() {
 			case "--max-item-seconds":
 				iw(&cfg.maxItemSeconds)
 			}
+		}
+		// exit-when-done drops the idle-retire floor so the LAST worker can
+		// leave once the seed work is terminal. Without this, minWorkers=1
+		// keeps one worker spinning on an empty board (measured: ~90s of
+		// pointless turns after everything was done).
+		if cfg.exitWhenDone {
+			cfg.minWorkers = 0
 		}
 		if err := cmdRun(dir, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "run: %v\n", err)

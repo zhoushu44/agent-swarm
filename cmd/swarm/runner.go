@@ -67,6 +67,23 @@ type runConfig struct {
 	maxItemSeconds int
 }
 
+// defaultRunConfig returns the shipped defaults.
+//
+// The three guards below are ON by default because they are what makes a run
+// predictable, and turning them off has only ever produced worse outcomes in
+// practice:
+//
+//   - maxWallClock: without it a run has no upper bound. Every other breaker
+//     is per-turn or per-output, so a worker that makes a tiny diff every turn
+//     never trips any of them (measured: one worker held an item for 12
+//     minutes while the rest of the board finished in 5).
+//   - maxItemSeconds: releases a stuck item back to the pool instead of
+//     letting one worker sit on it.
+//   - exitWhenDone: keys on SEED items being terminal, so "done" means "what
+//     the operator asked for is finished" rather than "the board is empty" —
+//     workers keep inventing useful work, so an empty board never happens.
+//
+// Override any of them explicitly; 0 disables the two time guards.
 func defaultRunConfig() runConfig {
 	return runConfig{
 		maxWorkers:         1000,
@@ -83,6 +100,9 @@ func defaultRunConfig() runConfig {
 		maxNoProgressTurns: 3,
 		serverPort:         17771,
 		harnessName:        "direct",
+		exitWhenDone:       true,
+		maxWallClock:       30 * time.Minute,
+		maxItemSeconds:     300,
 	}
 }
 
@@ -123,6 +143,11 @@ type swarmRunner struct {
 	// mergedCount / rejectedCount drive the run report's integration line.
 	mergedCount   int
 	rejectedCount int
+	// stalledSpawns counts consecutive worker spawns that retired without ever
+	// claiming or submitting. Three in a row means the harness cannot drive
+	// the tools, so the autoscaler stops respawning (otherwise it recycles
+	// worker names forever).
+	stalledSpawns int
 
 	startMs time.Time
 }
@@ -149,6 +174,9 @@ type workerState struct {
 	reapFailCount    int
 	reapFailAt       time.Time
 	tokenUsage       workerUsage
+	// heldItem is the item this worker currently holds ("" when it holds
+	// nothing). Drives the "no claim and no submission" retire check.
+	heldItem string
 	// lastArtifact is the output fingerprint ("f3+120-8") from the most recent
 	// auto-commit. The empty-output breaker compares it across turns: three
 	// turns in a row with an unchanged (or empty) fingerprint means the model
@@ -436,6 +464,14 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 	defer func() {
 		w.loopDone = true
 		r.releaseWorkerClaims(w)
+		// Remove from the live map: leaving it in grows the map forever (one
+		// entry per spawn, never freed) and makes worker naming drift upward
+		// (w2..w13..w200) on long runs. Status already says retired/crashed,
+		// so activeCount is unaffected.
+		r.mu.Lock()
+		delete(r.workers, w.name)
+		delete(r.itemHoldBy, w.name)
+		r.mu.Unlock()
 	}()
 
 	for {
@@ -451,7 +487,12 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 		}
 
 		// Idle suppression: skip a turn when nothing claimable and no active claim.
-		if r.cfg.harnessName != "echo" {
+		//
+		// Applies to EVERY harness, not just direct. The old condition excluded
+		// echo, so an echo run (or any harness whose model never calls /claim)
+		// spun through all hardMax turns doing nothing — measured: 120 empty
+		// turns and 132s of CPU on a 2-item board where nothing was claimable.
+		{
 			claimable, _ := r.store.ClaimableCount()
 			mine, _ := r.store.ActiveClaimsByPeer(w.name)
 			open, _ := r.store.OpenCount()
@@ -489,6 +530,25 @@ func (r *swarmRunner) workerLoop(ctx context.Context, w *workerState) {
 		}
 		if w.turn > r.cfg.maxTurns && r.noOpenWork() {
 			w.status = "retired"
+			return
+		}
+		// No-progress-by-turn: a worker that neither holds a claim nor has
+		// submitted anything for maxItemTurns consecutive turns is not going
+		// to start now. Retiring here bounds the wasted turns for any harness
+		// whose model never drives the tools (echo, or a misconfigured
+		// endpoint), instead of grinding through all hardMax turns.
+		if w.heldItem == "" && w.turn > r.cfg.maxItemTurns {
+			r.logEvent(store.RunEvent{
+				Kind: store.EvWorkerRetire, Actor: w.name,
+				Detail: fmt.Sprintf("no claim and no submission in %d turns", w.turn),
+			})
+			w.status = "retired"
+			// This spawn produced nothing: feed the autoscaler's give-up guard
+			// so it stops recycling worker names on a harness that cannot
+			// drive tools.
+			r.mu.Lock()
+			r.stalledSpawns++
+			r.mu.Unlock()
 			return
 		}
 		w.status = "working"
@@ -703,11 +763,25 @@ if !w.emptyArtifactAt.IsZero() && time.Since(w.emptyArtifactAt) > 3*time.Duratio
 }
 			// Item hold circuit breaker: abandon after maxItemTurns or maxItemTokens.
 			claims, _ := r.store.ActiveClaimsByPeer(w.name)
-r.mu.Lock()
-for _, c := range claims {
-	r.itemHoldBy[w.name] = c.ItemID
-}
-r.mu.Unlock()
+			r.mu.Lock()
+			for _, c := range claims {
+				r.itemHoldBy[w.name] = c.ItemID
+			}
+			r.mu.Unlock()
+			// Track what this worker holds so the retire check above knows
+			// whether it is making any progress at all.
+			if len(claims) > 0 {
+				if w.heldItem == "" {
+					// This worker just claimed something: the swarm IS making
+					// progress, so reset the give-up guard.
+					r.mu.Lock()
+					r.stalledSpawns = 0
+					r.mu.Unlock()
+				}
+				w.heldItem = claims[0].ItemID
+			} else {
+				w.heldItem = ""
+			}
 			for _, c := range claims {
 				if w.itemHold == nil || w.itemHold.itemID != c.ItemID {
 					w.itemHold = &itemHold{itemID: c.ItemID, turns: 1, since: time.Now()}
@@ -1297,9 +1371,28 @@ func (r *swarmRunner) autoscalerLoop(ctx context.Context) {
 			want = ceilingByMax
 		}
 
+		// Give-up guard: if the last several spawns all retired without ever
+		// claiming or submitting anything, more workers will not help — the
+		// harness/model is not driving the tools. Keep respawning and the
+		// autoscaler turns into a worker factory (measured on an echo run:
+		// w2..w13 recycled every ~7 turns forever).
+		//
+		// Track consecutive spawns that made no progress; after a few, cap the
+		// pool at zero and let the run end.
+		if r.stalledSpawns >= 3 {
+			want = 0
+			if active > 0 {
+				fmt.Fprintf(os.Stderr, "[swarm] autoscaler: giving up after %d stalled spawns (harness is not driving tools)\n", r.stalledSpawns)
+			}
+		}
+
 		// Resource guard.
+		//
+		// Skipped when giving up: the guard's floor (`want = 1`) would undo the
+		// give-up decision, and echo-style busy-spinning keeps CPU high enough
+		// to trigger it — a self-sustaining worker factory.
 		allow, sample, _ := r.guard.Allow()
-		if !allow {
+		if !allow && r.stalledSpawns < 3 {
 			// high pressure: freeze; critical: shrink by 1.
 			if sample.CPUPct > 92 || sample.MemPct > 92 {
 				want = active - 1
