@@ -2,3 +2,9 @@
 *.exe~
 *.tmp
 *.log
+
+# build artefacts — everyone builds their own platform's binary
+/swarm.exe
+*.exe
+*.test
+*.out
