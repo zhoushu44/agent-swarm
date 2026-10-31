@@ -75,6 +75,17 @@ func main() {
 			os.Exit(1)
 		}
 		dir := args[0]
+		// A leading "-" is a flag, not a directory. Without this guard,
+		// `swarm run --help` silently created `./--help/.swarm/worktrees/wN`,
+		// polluting the worktree registry with a second set of paths and
+		// making syncWorktree misbehave (workers claimed items but never
+		// called the LLM). Measured 2026-10-31.
+		if strings.HasPrefix(dir, "-") {
+			fmt.Fprintf(os.Stderr, "run: %q looks like a flag, not a directory.\n", dir)
+			fmt.Fprintf(os.Stderr, "usage: swarm run <dir> [flags]\n")
+			fmt.Fprintf(os.Stderr, "flags: --workers N --max-workers N --api-base URL --api-key K --model M --harness echo|direct\n")
+			os.Exit(1)
+		}
 		cfg := defaultRunConfig()
 		for i := 1; i < len(args); i++ {
 			sw := func(dst *string) {
