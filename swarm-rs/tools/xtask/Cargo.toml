@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A dev-only tool: it reads the workspace's source to find public methods with
+# no production caller. Not part of the shipped binary, so it is deliberately
+# absent from `[workspace.dependencies]` and the release profile.
+[dependencies]

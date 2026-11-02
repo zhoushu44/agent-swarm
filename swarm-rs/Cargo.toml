@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/swarm-core",
+    "crates/swarm-config",
+    "crates/swarm-store",
+    "crates/swarm-prompts",
+    "crates/swarm-harness",
+    "crates/swarm-git",
+    "crates/swarm-server",
+    "crates/swarm-cli",
+    "tools/xtask",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "net", "io-util"] }
+regex = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+once_cell = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+

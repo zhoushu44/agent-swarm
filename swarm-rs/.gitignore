@@ -1,0 +1,23 @@
+# Rust build artefacts. `target/` is 8+ GB here — it must never be committed.
+/target
+
+# Editor / OS noise.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Run scratch. `err.txt` / `out.txt` are ad-hoc redirects from local runs.
+err.txt
+out.txt
+
+# Local run directories people create while testing the CLI by hand.
+/.swarm/
+*.db
+*.db-shm
+*.db-wal
+
+# Release binaries built during smoke tests.
+/swarm
+/swarm.exe

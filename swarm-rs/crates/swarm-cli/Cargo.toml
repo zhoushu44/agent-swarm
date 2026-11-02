@@ -1,0 +1,32 @@
+[package]
+name = "swarm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "swarm"
+path = "src/main.rs"
+
+[dependencies]
+swarm-core = { path = "../swarm-core" }
+swarm-config = { path = "../swarm-config" }
+swarm-store = { path = "../swarm-store" }
+swarm-prompts = { path = "../swarm-prompts" }
+swarm-harness = { path = "../swarm-harness" }
+swarm-git = { path = "../swarm-git" }
+swarm-server = { path = "../swarm-server" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { version = "0.8", features = ["query"] }
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Foundation"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "net", "signal"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3"
