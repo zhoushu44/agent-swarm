@@ -26,6 +26,16 @@ cargo build --workspace --release
 
 `swarm board|status|log <dir>` 查看看板；`cargo run -p xtask` 找出"有测试但无生产调用者"的方法。
 
+## Skill：说一句"用 swarm"就能跑
+
+[`skills/swarm`](./skills/swarm/SKILL.md) 是给 Claude Code 用的运维 skill，固化了实测得来的操作知识（命令、坑、指标读法）。安装：
+
+```powershell
+.\skills\install.ps1        # 装到 ~/.claude/skills/
+```
+
+装完重启 Claude Code，说"用 swarm 做 X"即触发。详见 [`skills/README.md`](./skills/README.md)。
+
 ## 已实现
 
 | crate | 内容 | 测试 |

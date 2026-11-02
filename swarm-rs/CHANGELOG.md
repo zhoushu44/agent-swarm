@@ -22,6 +22,7 @@
 - **`--api-key-file` / `--api-key-stdin`** —— key 不再进进程表与 shell history。`--api-key` 保留兼容。
 - **`xtask`** —— `cargo run -p xtask` 列出没有生产调用者的公开方法。
 - **`RepoError::code()` / `remedy()`** —— `MERGE_CONFLICT` / `GATE_FAILED` / `GIT_ERROR` / `REPO_ERROR` 稳定词表 + 可操作的补救说明。
+- **`skills/swarm`** —— 随仓库分发的 Claude Code 运维 skill，`.\skills\install.ps1` 一键安装。把"跑一次 swarm"的实测知识（含排障速查）固化成可触发的手册。
 
 ### 修复
 
