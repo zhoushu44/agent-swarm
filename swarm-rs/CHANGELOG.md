@@ -4,6 +4,46 @@
 
 ---
 
+## [0.3.0] — 2026-11-05
+
+三个「跑到一半就不动」的缺陷，全部来自三轮真实跑（254 / 175 / 72 个 item 的逆向分析），
+每次都停在 60-70% 且 `0 failed`。**测试 213 全绿，新增回归 6 个。**
+
+### 修复
+
+- **autoscaler 的 GiveUp 是终态** —— `stalled_spawns >= 3` 时 `decide()` 无条件返回
+  `GiveUp`，而 `decay()` 要求池子为空才降计数；池子空恰恰是 GiveUp 不 spawn 造成的，
+  形成死锁。日志写「harness 不驱动工具」，实际 worker 已经做完了它拿到的活。
+  现在池空且仍有 pending 时发一个探针 spawn（`active == 0 && open > 0`），探针受 decay
+  窗口限速，不会变成 spawn 风暴。
+- **健康退出的 worker 被误判为 stalled** —— 判据原是 `held_item().is_none()`，而每个按
+  `--exit-when-done` 正常退出的 worker 都满足它，三次退出即触发 GiveUp。改为
+  `no_progress_streak() == 0`。（`streak < turn()` 也不对：死端点是 `turn=4 streak=3`，
+  看起来像「有一轮有产出」，实际那轮正是启动计数的那轮。）
+- **guard 9 超时释放无退避** —— 超时后 item 直接回 `pending` 且不设 `not_before`，下一个
+  worker 几秒后领走、在同样思路上再烧一个 lease。20MB bundle 实测连续 5 次、每次约 800 秒、
+  零进展。新增 `release_with_backoff()`：按 FAIL 记录数指数退避 30s→60s→120s→240s→300s，
+  第 `MAX_ITEM_RECLAIMS`(4) 次后直接标 `failed`。
+- **`resource_leases` 主键错误** —— `token` 原为单列主键，但一个 claim 会为名下每个文件插
+  一行租约，第二个文件必然撞 `UNIQUE constraint failed`，导致 `POST /claim` 全部 500、整轮
+  跑不动。改为复合主键 `(resource, token)`，并加
+  `rebuild_resource_leases_if_token_only_pk()` 原地重建旧库（保留原有数据）。
+
+### 变更
+
+- **worker prompt 补大输入指导** —— bash 输出硬截断 16KB，`cat` 一个 2MB bundle 只能看到
+  0.8%。新增「先 `wc -c` 量大小 → 单行按字节切片 → 多行按行范围切 → 优先 `grep`/`jq`
+  提取而不是通读」四步。
+- **worker prompt 补「负结果也是结果」** —— 输入确实不含目标内容时，写出明确的
+  not-present 结论并提交，比耗光 lease 更有价值。
+
+### 工具
+
+- `examples/bless_golden.rs` —— 有意改 prompt 后刷新 golden fixture（原生成器是 Go 侧
+  脚本，Rust-only clone 里没有）。
+
+---
+
 ## [0.2.0] — 2026-11-02
 
 借鉴 DeepSeek Harness 团队《Super-agent 设计探索》及四个开源多智能体项目（OpenRath / OpenPARL / agent-fleet-manager / cc-fleet）后的系统性升级。

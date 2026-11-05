@@ -2,7 +2,7 @@
 
 `agent-swarm`（Go v5.8.0）的 Rust 重写。**全部完成**：配置、存储、prompt、harness、git 集成、HTTP API、runner（14 条熔断器 + autoscaler + integrator）、CLI。
 
-**当前版本 `v0.2.0`** —— 变更记录见 [`CHANGELOG.md`](./CHANGELOG.md)。
+**当前版本 `v0.3.0`** —— 变更记录见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ```
 cargo test --workspace     # 333 passed
@@ -184,3 +184,4 @@ cargo run -p xtask            # 列出没有生产调用者的 pub 方法
 仍未做（`docs/SUPER-AGENT-IMPROVEMENT-PLAN.md` §5 明确列为「不照搬」）：Router 分层/联邦、A2A 协议栈、端侧 daemon 零信任、记忆压实 Worker、五档自治旋钮——swarm-rs 是单机单信任域的离线编排器，这些解决的是它现在没有的问题。
 
 完整方案见 [`../docs/RUST-TARGET-ARCHITECTURE.md`](../docs/RUST-TARGET-ARCHITECTURE.md)。
+
