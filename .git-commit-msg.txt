@@ -1,0 +1,65 @@
+fix(swarm-rs): 修复长跑中途停摆、大文件空转、资源锁污染
+
+三个缺陷都在多轮真实跑里复现过（254 / 175 / 72 个 item 的逆向分析任务，
+每次都停在 60-70% 且 0 failed）。
+
+1. autoscaler: GiveUp 是终态，池子空了就永久停摆
+
+   `decide()` 在 `stalled_spawns >= 3` 时无条件返回 GiveUp，而 `decay`
+   需要池子为空才会衰减——但池子空恰恰是 GiveUp 不 spawn 造成的，死锁。
+   每次跑到 60-70% 就停，日志却写「harness 不驱动工具」，实际是 worker
+   已经做完了它拿到的活。
+
+   修复：池空且仍有 pending 时发一个探针 spawn（active == 0 && open > 0），
+   让 decay 有机会把计数降下来。探针本身受 decay 窗口限速，不会变成 spawn 风暴。
+
+2. runner: 健康退出的 worker 被误判为 stalled
+
+   判据原是 `held_item().is_none()`，而每个做完活按 `--exit-when-done`
+   退出的 worker 都满足它。三次正常退出就触发 GiveUp。
+
+   修复为 `no_progress_streak() == 0`——它直接回答「这个 worker 有没有
+   做出过不产生 no-progress 的回合」。
+
+   注意 `no_progress_streak() < turn()` 也不对：死端点上是 turn=4 streak=3，
+   看起来像「有一轮有产出」，实际那轮正是启动计数的那一轮。这条在实现时
+   踩过，靠临时打点才发现。
+
+3. store: guard 9 超时释放走裸 release()，无退避
+
+   超时后 item 直接回 pending 且不设 `not_before`，下一个 worker 几秒后
+   领走、在同样思路上再烧一个 lease。20MB bundle 实测连续 5 次、每次约
+   800 秒、零进展——item 永远不死也不活。
+
+   新增 `release_with_backoff()`：按 FAIL 记录数指数退避
+   30s → 60s → 120s → 240s → 300s，第 `MAX_ITEM_RECLAIMS`(4) 次后直接
+   标 failed 而不是永远循环。
+
+4. prompts: 补两条大输入 / 负结果指导
+
+   - bash 输出硬截断 16KB，`cat` 一个 2MB bundle 只能看到 0.8%。
+     加了「先 wc -c 量大小 → 单行按字节切片 → 多行按行范围切 →
+     优先 grep/jq 提取而不是通读」四步。
+   - 「负结果也是结果」：输入确实不含目标内容时，写出明确的
+     not-present 结论并提交，比耗光 lease 更有价值。
+
+5. store: schema 修复 resource_leases 主键
+
+   `token` 原为单列主键，但一个 claim 会为名下每个文件插一行租约，第二个
+   文件必然撞 `UNIQUE constraint failed: resource_leases.token`，导致
+   `POST /claim` 全部 500、整轮跑不动。
+
+   改为复合主键 `(resource, token)`，并加
+   `rebuild_resource_leases_if_token_only_pk()` 原地重建旧库（保留原有数据）。
+
+测试：213 个全绿。新增回归测试 6 个：
+
+- one_claim_can_hold_several_resource_leases
+- migrates_token_only_pk_table_to_composite_key
+- release_with_backoff_delays_the_next_claim
+- release_with_backoff_grows_with_repeated_timeouts
+- item_dies_after_max_reclaims_instead_of_looping_forever
+- give_up_is_not_terminal_when_work_remains
+
+另加 `examples/bless_golden.rs`：有意改 prompt 后刷新 golden fixture 用
+（原生成器是 Go 侧脚本，这个 clone 里没有）。

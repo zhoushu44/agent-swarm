@@ -444,6 +444,103 @@ fn claimable_respects_not_before() {
     assert_eq!(st.claimable_count().unwrap(), 1, "item returns after backoff");
 }
 
+// ------------------------------------------------------------------
+// Guard 9 requeue: an item that runs over its per-item limit must be held
+// back before the next worker may take it, and must eventually die.
+//
+// The bug this covers: `release()` put the item straight back to `pending`
+// with no `not_before`, so the next worker claimed it seconds later and
+// burned another full lease on the same approach. On a 20 MB bundle that was
+// five consecutive 800s leases with zero progress between them — the item
+// never failed and never succeeded, it just kept consuming the pool.
+// ------------------------------------------------------------------
+
+#[test]
+fn release_with_backoff_delays_the_next_claim() {
+    let (st, clock) = store_with_clock();
+    let id = seed(&st, "analysis/huge.json");
+    let res = st.claim(&id, "w1").unwrap();
+
+    let delay = st.release_with_backoff(&res.token).unwrap();
+    assert!(delay > 0, "a timed-out item must not be immediately claimable");
+    assert_eq!(st.get_item(&id).unwrap().status, status::PENDING);
+    assert_eq!(
+        st.claimable_count().unwrap(),
+        0,
+        "not_before must hide the item from the next claimer"
+    );
+
+    clock.fetch_add(delay + 1, Ordering::SeqCst);
+    assert_eq!(
+        st.claimable_count().unwrap(),
+        1,
+        "the item returns once the backoff elapses"
+    );
+}
+
+#[test]
+fn release_with_backoff_grows_with_repeated_timeouts() {
+    let (st, clock) = store_with_clock();
+    let id = seed(&st, "analysis/huge.json");
+
+    let mut delays = Vec::new();
+    for _ in 0..3 {
+        // Each attempt records the FAIL that the real runner writes before
+        // releasing; the backoff is derived from those rows.
+        st.add_context(Event {
+            peer: "w1".into(),
+            kind: "FAIL".into(),
+            item_id: Some(id.clone()),
+            text: "released after over the per-item limit".into(),
+            tags: Some(vec!["item".into(), "timeout".into(), "item-hold".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let res = st.claim(&id, "w1").unwrap();
+        delays.push(st.release_with_backoff(&res.token).unwrap());
+        clock.fetch_add(400_000, Ordering::SeqCst);
+    }
+
+    assert!(
+        delays[1] > delays[0] && delays[2] > delays[1],
+        "backoff must grow with each reclaimed attempt, got {:?}",
+        delays
+    );
+}
+
+#[test]
+fn item_dies_after_max_reclaims_instead_of_looping_forever() {
+    let (st, clock) = store_with_clock();
+    let id = seed(&st, "analysis/impossible.json");
+
+    // MAX_ITEM_RECLAIMS timeouts in a row. Each one records its FAIL first, the
+    // way the runner does.
+    for _ in 0..swarm_store::store::MAX_ITEM_RECLAIMS {
+        st.add_context(Event {
+            peer: "w1".into(),
+            kind: "FAIL".into(),
+            item_id: Some(id.clone()),
+            text: "released after over the per-item limit".into(),
+            tags: Some(vec!["item".into(), "timeout".into(), "item-hold".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        if st.get_item(&id).unwrap().status != status::PENDING {
+            break;
+        }
+        let res = st.claim(&id, "w1").unwrap();
+        st.release_with_backoff(&res.token).unwrap();
+        clock.fetch_add(400_000, Ordering::SeqCst);
+    }
+
+    assert_eq!(
+        st.get_item(&id).unwrap().status,
+        status::FAILED,
+        "an item that never fits in one lease must be failed, not requeued forever"
+    );
+    assert_eq!(st.claimable_count().unwrap(), 0);
+}
+
 #[test]
 fn seed_progress_follows_parent_lineage() {
     let (st, _) = store_with_clock();

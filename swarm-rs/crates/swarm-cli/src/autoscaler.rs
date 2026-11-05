@@ -158,6 +158,20 @@ impl Autoscaler {
         load: LoadSample,
     ) -> ScaleDecision {
         if self.stalled_spawns >= 3 {
+            // Give up only while there is nothing left to prove. Once the pool
+            // has drained to zero, a single probe spawn costs one worker and
+            // answers the only question that matters: is the endpoint still
+            // dead? Returning GiveUp unconditionally is what wedged every long
+            // run — the counter could not decay because `decay` requires the
+            // pool to be empty AND a spawn to have happened, and GiveUp never
+            // spawns. This breaks that cycle.
+            //
+            // The probe is rate-limited by `decay` (which halves the counter
+            // every 5 minutes of quiet), so a permanently broken endpoint sees
+            // one probe per decay window, not a spawn storm.
+            if active == 0 && open > 0 {
+                return ScaleDecision::Spawn(1);
+            }
             return ScaleDecision::GiveUp;
         }
         let want = self.desired_workers(open, recent_split, active, load);
@@ -399,6 +413,39 @@ mod tests {
         a.note_stalled_spawn();
         assert_eq!(
             a.decide(1000, 0, 5, 0, LoadSample::default()),
+            ScaleDecision::GiveUp
+        );
+    }
+
+    /// Regression: give-up used to be terminal.
+    ///
+    /// With `stalled_spawns >= 3` the autoscaler returned `GiveUp` forever, and
+    /// `decay` could not rescue it because the pool being empty was also the
+    /// condition that stopped new stalls from arriving. The observed shape: every
+    /// run stopped at 60-70% with `0 failed`, dozens of items still pending, and
+    /// a log line claiming "the harness is not driving tools" — which was false,
+    /// the harness had just finished the items it was given.
+    ///
+    /// Now a drained pool with work left gets one probe spawn.
+    #[test]
+    fn give_up_is_not_terminal_when_work_remains() {
+        let mut a = Autoscaler::new(cfg());
+        for _ in 0..3 {
+            a.note_stalled_spawn();
+        }
+        // Pool still has workers: keep giving up (nothing to probe with).
+        assert_eq!(
+            a.decide(50, 0, 2, 0, LoadSample::default()),
+            ScaleDecision::GiveUp
+        );
+        // Pool drained but items remain: probe once instead of wedging.
+        assert_eq!(
+            a.decide(50, 0, 0, 0, LoadSample::default()),
+            ScaleDecision::Spawn(1)
+        );
+        // Nothing left to do: GiveUp is the right answer, no probe wasted.
+        assert_eq!(
+            a.decide(0, 0, 0, 0, LoadSample::default()),
             ScaleDecision::GiveUp
         );
     }

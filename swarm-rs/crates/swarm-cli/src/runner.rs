@@ -1331,23 +1331,32 @@ impl WorkerHandle {
                     // The git work is NOT touched: commits live on this worker's
                     // branch and uncommitted edits stay on disk, so the next
                     // worker inherits the half-finished state either way.
-                    for c in self.store.active_claims_by_peer(&self.peer()).unwrap_or_default() {
-                        if c.item_id == item_id {
-                            let _ = self.store.release(&c.token);
-                        }
-                    }
+                    // The FAIL event is written BEFORE the release so the backoff
+                    // computation can see it: `release_with_backoff` counts prior
+                    // item-hold FAILs for this item to pick the delay. Writing it
+                    // after would make every attempt look like the first one.
                     let _ = self.store.add_context(swarm_core::Event {
                         id: 0,
                         peer: self.peer(),
                         kind: "FAIL".into(),
-                        item_id: Some(item_id),
+                        item_id: Some(item_id.clone()),
                         text: format!(
                             "released after over the per-item limit — do not repeat this approach; try a different one ({reason}). Partial work to build on: {}",
                             progress.handover_note()
                         ),
-                        tags: Some(vec!["item".into(), "timeout".into()]),
+                        tags: Some(vec!["item".into(), "timeout".into(), "item-hold".into()]),
                         ts: 0,
                     });
+                    for c in self.store.active_claims_by_peer(&self.peer()).unwrap_or_default() {
+                        if c.item_id == item_id {
+                            // Backoff, not plain release: the item goes back to
+                            // pending with `not_before` set, so the next claimer
+                            // does not immediately re-burn a lease on the same
+                            // approach. Plain `release` spun this loop forever on
+                            // oversized inputs.
+                            let _ = self.store.release_with_backoff(&c.token);
+                        }
+                    }
                     self.record_raw(GuardId::ItemHold, reason);
                 }
             }
@@ -1417,13 +1426,32 @@ impl WorkerHandle {
         for c in self.store.active_claims_by_peer(&self.peer()).unwrap_or_default() {
             let _ = self.store.release(&c.token);
         }
-        let stalled = cb.held_item().is_none() && cb.turn() <= self.cfg.max_item_turns;
-        if stalled {
-            // Retired without ever claiming anything: a stalled spawn. This is
-            // the only thing that can stop the autoscaler from spawning 1000
-            // workers against an endpoint that never drives the tools.
+        // A stalled spawn is one that never did any work. The first version of
+        // this test was `held_item().is_none()`, which is true for every worker
+        // that finishes an item and then exits `--exit-when-done` — so a healthy
+        // run that completed a few items and drained the pool counted as three
+        // stalls and the autoscaler gave up with work still pending. That is the
+        // bug that made every long run stop at 60-70% with zero failures.
+        //
+        // The right question is "did this worker EVER make progress", and
+        // `no_progress_streak` answers it directly: it is the count of
+        // consecutive turns that changed nothing, so `streak == 0` means the last
+        // turn before exit did real work. Comparing against `turn()` does not
+        // work — a worker against a dead endpoint goes `turn=4 streak=3`, which
+        // looks like "one turn made progress" when in fact the first turn is
+        // simply the one that STARTED the streak.
+        let did_work = cb.held_item().is_some()
+            || (cb.turn() > 0 && cb.no_progress_streak() == 0);
+        if !did_work {
             self.stalled_spawns.fetch_add(1, Ordering::SeqCst);
             self.record_raw(GuardId::AutoscalerGiveUp, "spawn produced no claim".into());
+        } else {
+            // A worker that got real work clears the streak: the pool is
+            // demonstrably able to make progress, so the give-up counter has no
+            // business staying high. Without this reset, three unrelated slow
+            // starts at any point in a multi-hour run would permanently disable
+            // scaling.
+            self.stalled_spawns.store(0, Ordering::SeqCst);
         }
         self.active_workers.fetch_sub(1, Ordering::SeqCst);
     }
@@ -1838,5 +1866,7 @@ fn guard_of(v: &Verdict) -> GuardId {
         _ => GuardId::HardTurns,
     }
 }
+
+
 
 

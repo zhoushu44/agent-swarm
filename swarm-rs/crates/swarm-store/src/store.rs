@@ -19,6 +19,15 @@ use swarm_core::{
 use crate::resources::{artifact_key, item_resources};
 use crate::schema;
 
+/// How many times one item may be reclaimed for running over its per-item limit
+/// before it is marked failed instead of requeued.
+///
+/// Four attempts is enough to tell "this was unlucky" from "this does not fit in
+/// one lease": a 20 MB minified bundle blew through five consecutive 800s leases
+/// with no progress between any of them, and the only thing that bounded the
+/// damage was the run's wall clock.
+pub const MAX_ITEM_RECLAIMS: i64 = 4;
+
 /// Clock abstraction so tests can control lease expiry deterministically.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
@@ -590,6 +599,90 @@ impl Store {
         Ok(())
     }
 
+    /// Release a claim that ran out of time, and hold the item back before the
+    /// next worker may take it.
+    ///
+    /// `release` alone puts the item straight back to `pending`, which is why a
+    /// task that cannot finish in one lease is doomed to repeat: every worker
+    /// that claims it burns a full lease on the same approach, forever. The
+    /// observed shape on a 20 MB bundle was ~800s per attempt, five attempts in a
+    /// row, no progress between them.
+    ///
+    /// The backoff grows with the number of times this item has already been
+    /// reclaimed, capped at 60s, so a genuinely stuck item eventually stops
+    /// competing with healthy work instead of monopolising a worker slot.
+    ///
+    /// Returns the delay applied, in milliseconds (0 when the item was not in a
+    /// releasable state).
+    pub fn release_with_backoff(&self, token: &str) -> Result<i64> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(SwarmError::Invalid("release: missing token".into()));
+        }
+        let now = self.now();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|e| SwarmError::Store(format!("release tx: {}", e)))?;
+
+        let item_id: Option<String> = tx
+            .query_row(
+                "SELECT item_id FROM claims WHERE token = ?",
+                params![token],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| SwarmError::Store(format!("release lookup: {}", e)))?;
+        let item_id = item_id.ok_or_else(|| SwarmError::NotFound(format!("claim {:?}", token)))?;
+
+        // Count prior reclamations from the fact layer rather than adding a
+        // column: the events table already records every FAIL for this item, and
+        // a schema change would break Go compatibility.
+        let prior: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE item_id = ? AND kind = 'FAIL'
+                   AND (tags LIKE '%item-hold%' OR text LIKE '%per-item limit%')",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| SwarmError::Store(format!("release prior count: {}", e)))?;
+
+        tx.execute("DELETE FROM claims WHERE token = ?", params![token])
+            .map_err(|e| SwarmError::Store(format!("release delete: {}", e)))?;
+        tx.execute(
+            "DELETE FROM resource_leases WHERE token = ?",
+            params![token],
+        )
+        .map_err(|e| SwarmError::Store(format!("release resource delete: {}", e)))?;
+
+        // 30s, 60s, 120s, 240s, then 300s. Long enough that a healthy worker is
+        // not immediately re-fed the same poisoned item, short enough that a
+        // transient stall does not park it for the rest of the run.
+        let backoff_ms = (30_000i64 << prior.min(3)).min(300_000);
+
+        // Attempts are capped as well as spaced out. An input that cannot be
+        // finished inside one lease is not fixed by waiting: after
+        // `MAX_ITEM_RECLAIMS` timeouts the item is marked failed and the operator
+        // can split it by hand. Without this cap the item never dies — it just
+        // keeps costing a lease every few minutes until the wall clock runs out.
+        if prior + 1 >= MAX_ITEM_RECLAIMS {
+            tx.execute(
+                "UPDATE items SET status = ? WHERE id = ?",
+                params![status::FAILED, item_id],
+            )
+            .map_err(|e| SwarmError::Store(format!("release give up: {}", e)))?;
+        } else {
+            tx.execute(
+                "UPDATE items SET status = ?, not_before = ? WHERE id = ? AND status = ?",
+                params![status::PENDING, now + backoff_ms, item_id, status::IN_PROGRESS],
+            )
+            .map_err(|e| SwarmError::Store(format!("release reset: {}", e)))?;
+        }
+        tx.commit()
+            .map_err(|e| SwarmError::Store(format!("release commit: {}", e)))?;
+        Ok(backoff_ms)
+    }
     /// Extend a claim's lease.
     ///
     /// The resource leases must be extended with it, or a long-held item stops

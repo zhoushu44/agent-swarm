@@ -201,10 +201,17 @@ async fn stalled_spawns_stop_the_autoscaler() {
     // busy. The shared 3s wall clock in `fast_cfg` is too tight: under load the
     // run can stop after a single give-up, which is correct behaviour but not
     // enough to assert on.
+    //
+    // 12s/8s was still flaky for exactly that reason: under `cargo test` with
+    // every core busy, the whole 10-test file finishes in ~14s, so a run that
+    // starts late gets a wall clock that expires before the autoscaler's 1s tick
+    // has fired three times. Widened to 20s/12s; the test still finishes in
+    // well under a second when it passes, because the give-up itself is what
+    // ends it, not the clock.
     let mut cfg = fast_cfg();
     cfg.max_workers = 32;
-    cfg.max_wall_clock = std::time::Duration::from_secs(12);
-    cfg.idle_stop = std::time::Duration::from_secs(8);
+    cfg.max_wall_clock = std::time::Duration::from_secs(20);
+    cfg.idle_stop = std::time::Duration::from_secs(12);
     let repo = Repo::new(dir);
     let runner = std::sync::Arc::new(Runner::new(
         dir.to_string_lossy().to_string(),
@@ -219,10 +226,22 @@ async fn stalled_spawns_stop_the_autoscaler() {
 
     // The autoscaler must have recorded the give-up, not spawned 32 workers
     // against an endpoint that never drives the tools.
+    //
+    // The assertion is on the *spawn cap*, not on the breaker count alone. GiveUp
+    // is no longer terminal: a drained pool with work left gets one probe spawn
+    // so a transient outage cannot wedge a multi-hour run (see
+    // `give_up_is_not_terminal_when_work_remains`). What must still hold is that
+    // the pool never grows to `max_workers` against a dead endpoint — the probe
+    // is one worker at a time, and every probe that produces nothing is recorded.
     let report = probe.breaker_report();
     assert!(
         report.count(swarm_cli::GuardId::AutoscalerGiveUp) > 0,
         "guard 11 must fire when spawns produce no claims"
+    );
+    assert!(
+        report.count(swarm_cli::GuardId::AutoscalerGiveUp) < 32,
+        "probes must stay rate-limited; got {} give-up records for a 32-worker cap",
+        report.count(swarm_cli::GuardId::AutoscalerGiveUp)
     );
 }
 
