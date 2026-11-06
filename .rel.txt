@@ -1,0 +1,10 @@
+chore(release): bump swarm-rs to 0.4.0 — 跨 run 记忆
+
+0.3.0 → 0.4.0（次版本号：新增能力，无破坏性改动）。
+
+CHANGELOG 记录了这轮的两个新模块：
+- `swarm-store::MemoryStore`：独立记忆文件，按 project/tag/global 作用域
+- `swarm-cli::compact`：把多条笔记折叠成少数几条
+
+以及为什么 compact 做成命令而不是 swarm item，和压缩的三条安全网
+（覆盖校验、FAIL 不可丢弃、拒绝回声）。

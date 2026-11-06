@@ -1085,7 +1085,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swarm-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "regex",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "swarm-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "swarm-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "swarm-git"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "once_cell",
  "regex",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "swarm-harness"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "once_cell",
  "regex",
@@ -1155,14 +1155,14 @@ dependencies = [
 
 [[package]]
 name = "swarm-prompts"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "swarm-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "http-body-util",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "swarm-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "once_cell",
  "regex",

@@ -4,6 +4,73 @@
 
 ---
 
+## [0.4.0] — 2026-11-06
+
+跨 run 记忆：让下一次 run 不必从零认知开始。
+
+### 新增
+
+- **`swarm-store::MemoryStore`** —— 独立的 SQLite 记忆文件（`~/.swarm/memory.db`
+  或 `$SWARM_MEMORY`），与项目 board 分开存。board 是一次性的，记忆必须跨 run
+  跨项目存活，两种寿命两个文件。
+
+  作用域是自由字符串，约定三种前缀：`project:<abs path>`（本仓库）、`tag:<name>`
+  （跨项目同类经验）、`global`（本机怪癖）。前缀匹配带 `%`/`_` 转义——Windows
+  路径里的下划线不能变成通配符。`(scope, text)` 唯一，同一教训反复 POST 只留一条。
+
+- **记忆注入** —— `Runner::new` 读一次、渲染一次，全程不变（每 turn 变化会毁掉
+  KV cache）。块插在 conventions 之后、TOOLS 之前；为空则完全不出现在 prompt 里，
+  所以 golden fixture 保持字节一致。
+
+- **自动沉淀** —— run 结束后只把 `FACT` 和 `FAIL` 写回，且文本短于 40 字符的丢弃
+  （过滤 "w3 online" 这类）。记忆文件损坏或不可写不影响 run。
+
+- **`swarm memory`** —— `list` / `add` / `search` / `forget` / `prune`。
+  `add` 对 `project:` 作用域走与 runner 相同的 canonicalize，否则 shell 里敲的
+  短路径（`C:/PROGRA~1/foo`）会写进一个永远没人读的作用域，而且看起来像成功了。
+
+- **`swarm memory compact`** —— 把多条笔记折叠成少数几条。
+
+### 设计说明：为什么 compact 是命令而不是 swarm item
+
+compaction 只需要：读一张表、调一次模型、写回。不需要 board、worktree、claim、
+gate、merge。走 swarm 会得到一个「worktree 是用户 home 目录、验收标准是散文好不好
+读」的 item——gate 无法检查。它还会和并发写 FACT 的 worker 抢同一个记忆文件。
+
+### 压缩的三条安全网
+
+缺少任何一条，这个功能都会变成数据丢失器：
+
+1. **覆盖校验** —— 每个输入 id 必须恰好出现一次。模型忘掉十条就会清空十条，而没人
+   会注意到，直到重新走一遍那些坑。
+2. **`FAIL` 不可丢弃** —— 那是花了一整个 lease 才换来的死路记录，只能合并。硬规则，
+   不是 prompt 建议。
+3. **拒绝回声** —— 首次真实跑时模型把 `#1 [FACT] cmd.exe 里...` 原样复制回来当作
+   「合并结果」。多源合并若逐字包含某个源，就是没干活。
+
+### 模型不稳定，所以有重试
+
+同一个 prompt 两次结果不同：一次正确丢弃进度噪音，下一次把 `[FACT]` 标记复制进输出。
+与其放宽校验器直到它接受烂输出，不如校验失败即重试（最多 3 次）。格式噪音（`#3
+[FACT] xxx` 前缀）单独清洗而不拒绝整份 plan——为格式问题让整次压缩失败，会让这个
+命令在模型行为不稳定时完全不可用。
+
+### 实测
+
+`deepseek-v4-flash`，5 条 global 笔记 → 3 条：
+
+```
+plan: 3 merged note(s) from 5 input(s), 0 dropped, 0 left as-is
+  + [#4,#5,#6] 扫描第 1–3 轮并行进行中：worker w1/w2/w3 各自处理对应分片
+  + [#7] Playwright 在 Windows 上需要 --no-sandbox，否则启动失败
+  + [#1] cmd.exe 里 git commit -m 带空格会截断，需使用单 token 消息
+applied: 3 merged note(s) written, 5 old note(s) removed
+```
+
+测试 25 个套件全绿；新增 16 个（memory 7、compact 9）。
+
+---
+
 ## [0.3.0] — 2026-11-05
 
 三个「跑到一半就不动」的缺陷，全部来自三轮真实跑（254 / 175 / 72 个 item 的逆向分析），
