@@ -14,14 +14,31 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// The resource regex, copied verbatim from Go `items.go` L27.
+/// The resource regex, copied verbatim from Go `items.go` L27, with one
+/// deliberate extension.
 ///
 /// `(?:[A-Za-z0-9_.@-]+/)*` — optional path segments
 /// `[A-Za-z0-9_@.-]+\.[A-Za-z][A-Za-z0-9]{0,6}` — filename + extension
 /// `(?:#[A-Za-z_][A-Za-z0-9_]*)?` — optional `#symbol` suffix
+/// `|#byte:\d+-\d+` — optional byte-range suffix (see below)
+///
+/// The `#byte:START-END` form exists because the resource axis cannot decompose a
+/// single huge file, so `split_oversized_single_file` cuts it along BYTES and
+/// names the children `path#byte:START-END`. Without this alternation the regex
+/// matches only `path`, every slice gets the same `artifact_key`, and
+/// `create_item` folds them all into the first one — the split silently produces
+/// a single child and the file is never actually decomposed.
+///
+/// `#symbol` still matches for every normal symbol-granularity title, so this
+/// stays compatible with the Go behaviour the rest of the system depends on.
+///
+/// The `byte:` branch MUST come first. Rust's regex alternation is
+/// leftmost-first, and `[A-Za-z_][A-Za-z0-9_]*` happily matches just `byte` and
+/// stops at the `:` — so with the old order the match was `bundle.js#byte` and
+/// the range was silently dropped, collapsing every window to one key.
 pub static RESOURCE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?:[A-Za-z0-9_.@-]+/)*[A-Za-z0-9_@.-]+\.[A-Za-z][A-Za-z0-9]{0,6}(?:#[A-Za-z_][A-Za-z0-9_]*)?",
+        r"(?:[A-Za-z0-9_.@-]+/)*[A-Za-z0-9_@.-]+\.[A-Za-z][A-Za-z0-9]{0,6}(?:#byte:\d+-\d+|#[A-Za-z_][A-Za-z0-9_]*)?",
     )
     .expect("resource regex is a compile-time constant")
 });

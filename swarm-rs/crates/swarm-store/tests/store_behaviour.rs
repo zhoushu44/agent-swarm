@@ -1205,3 +1205,14 @@ fn run_log_reads_legacy_rows_without_provenance() {
     assert_eq!(rows[0].old_value, "");
     assert_eq!(rows[0].new_value, "");
 }
+
+/// The byte-range suffix must survive `artifact_key`, or every slice of one
+/// file folds into the first and the split produces a single child.
+#[test]
+fn byte_range_titles_are_distinct_dedup_keys() {
+    use swarm_store::resources::artifact_key;
+    let a = artifact_key("bundle.js#byte:0-163840");
+    let b = artifact_key("bundle.js#byte:163840-327680");
+    assert_ne!(a, b, "each byte window must have its own key, got {a:?} for both");
+    assert!(a.contains("byte"), "the range must be part of the key, got {a:?}");
+}

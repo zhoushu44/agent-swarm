@@ -709,3 +709,120 @@ async fn the_hold_clock_criterion_is_reachable() {
     store.release(&res.token).unwrap();
 }
 
+
+/// A single oversized file must be split BY BYTES, not left whole.
+///
+/// `split_item` only knows the resource axis, and one file is one resource, so a
+/// huge single-file item could never be decomposed — it just burned lease after
+/// lease. The bash tool truncates at 16 KB, so a worker on a 2 MB bundle saw 0.8%
+/// and could not tell.
+#[tokio::test]
+async fn oversized_single_file_splits_into_byte_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scratch_repo(dir);
+
+    // 1 MB of text: well past the 512 KB threshold, and shaped like a real
+    // minified bundle (one very long line) so a line-based splitter would fail.
+    let big = "x".repeat(1024 * 1024);
+    std::fs::write(dir.join("bundle.js"), &big).unwrap();
+    let out = Command::new("git").args(["add", "-A"]).current_dir(dir).output().unwrap();
+    assert!(out.status.success());
+    let out = Command::new("git")
+        .args(["commit", "-q", "-m", "add bundle"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let store = open_store(dir);
+    let item = store
+        .create_item(CreateItemInput {
+            peer: "seed".into(),
+            title: "bundle.js".into(),
+            detail: "analyse this bundle".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let cfg = fast_cfg();
+    let repo = Repo::new(dir);
+    let runner = std::sync::Arc::new(Runner::new(
+        dir.to_string_lossy().to_string(),
+        cfg,
+        store.clone(),
+        repo,
+    ));
+
+    let split = runner.split_failed_item(&item.id).await;
+    assert!(split, "a 1 MB single-file item must be splittable by bytes");
+
+    let children = store.children_of(&item.id).unwrap();
+    assert!(
+        children.len() >= 2,
+        "expected several byte windows, got {}",
+        children.len()
+    );
+    for c in &children {
+        assert!(
+            c.title.starts_with("bundle.js#byte:"),
+            "child must name a byte range, got {:?}",
+            c.title
+        );
+        assert!(
+            c.detail.contains("byte-offset window"),
+            "child detail must warn against a full-file read"
+        );
+    }
+    // Every byte of the file must be covered: no silently dropped tail.
+    let mut covered = 0u64;
+    for c in &children {
+        let range = c.title.split("#byte:").nth(1).unwrap();
+        let mut parts = range.split('-');
+        let start: u64 = parts.next().unwrap().parse().unwrap();
+        let end: u64 = parts.next().unwrap().parse().unwrap();
+        assert_eq!(start, covered, "windows must be contiguous");
+        covered = end;
+    }
+    assert_eq!(covered, 1024 * 1024, "the last window must reach EOF");
+}
+
+/// A small single file must NOT be split: an extra claim and merge costs more
+/// than the read it avoids.
+#[tokio::test]
+async fn small_single_file_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    scratch_repo(dir);
+    std::fs::write(dir.join("small.js"), "x".repeat(4096)).unwrap();
+    let out = Command::new("git").args(["add", "-A"]).current_dir(dir).output().unwrap();
+    assert!(out.status.success());
+    let out = Command::new("git")
+        .args(["commit", "-q", "-m", "add small"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let store = open_store(dir);
+    let item = store
+        .create_item(CreateItemInput {
+            peer: "seed".into(),
+            title: "small.js".into(),
+            detail: "read it".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let runner = std::sync::Arc::new(Runner::new(
+        dir.to_string_lossy().to_string(),
+        fast_cfg(),
+        store.clone(),
+        Repo::new(dir),
+    ));
+    assert!(
+        !runner.split_failed_item(&item.id).await,
+        "a 4 KB file is not worth splitting"
+    );
+    assert!(store.children_of(&item.id).unwrap().is_empty());
+}

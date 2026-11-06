@@ -405,8 +405,15 @@ impl Runner {
         // silent, so the caller believed it had split when it had not — the
         // failure-triggered split then looked broken while actually having never
         // applied. The caller distinguishes the two outcomes.
+        //
+        // A single file that is merely HUGE is a different problem with its own
+        // answer: slice it. Without this, an item naming one 20 MB bundle could
+        // not be decomposed at all, and the run burned five consecutive 800s
+        // leases on it before the wall clock saved us.
         if real.len() < 2 {
-            return false;
+            return self
+                .split_oversized_single_file(item_id, &item, &real)
+                .await;
         }
         if self.store.set_status(item_id, "split").is_err() {
             return false;
@@ -817,6 +824,96 @@ impl Runner {
         if let Ok(mut t) = self.totals.lock() {
             t.rejected += 1;
         }
+    }
+
+    /// Split an item that names exactly one file, when that file is too big for
+    /// one lease.
+    ///
+    /// The resource axis is useless here — one file is one resource key, so
+    /// `split_item` can only ever produce a single child that folds straight back
+    /// into the parent. The axis that does work is BYTES: cut the file into
+    /// offset windows, one child per window, each naming `path#byte:START-END`.
+    ///
+    /// Why this matters in practice: the bash tool truncates at 16 KB, so a
+    /// worker reading a 2 MB bundle sees 0.8% of it and cannot tell. Five
+    /// consecutive 800s leases were spent on one such item with zero progress
+    /// before this existed.
+    ///
+    /// Thresholds are deliberately conservative. Slicing a file a worker could
+    /// have handled costs an extra claim and merge; NOT slicing one it cannot
+    /// handle costs an entire lease, every time, forever.
+    async fn split_oversized_single_file(
+        &self,
+        item_id: &str,
+        item: &swarm_core::Item,
+        real: &[String],
+    ) -> bool {
+        /// Below this a worker can read the file in a handful of bash calls.
+        const SLICE_THRESHOLD: u64 = 512 * 1024;
+        /// Target size of one slice. Sits comfortably under the 16 KB bash
+        /// truncation once you account for escaping, and small enough that a
+        /// worker's first `sed`/`substr` gets real content.
+        const SLICE_BYTES: u64 = 160 * 1024;
+        /// Hard cap on children so one pathological item cannot flood the board.
+        const MAX_SLICES: u64 = 24;
+
+        let Some(path) = real.first() else {
+            return false;
+        };
+        // `path#symbol` is a symbol-granularity token, not a whole file: it was
+        // already split along the axis that makes sense for it.
+        if path.contains('#') {
+            return false;
+        }
+        let abs = self
+            .repo
+            .dir
+            .join(path.replace('/', std::path::MAIN_SEPARATOR_STR).as_str());
+        let Ok(meta) = tokio::fs::metadata(&abs).await else {
+            return false;
+        };
+        if !meta.is_file() || meta.len() < SLICE_THRESHOLD {
+            return false;
+        }
+
+        let total = meta.len();
+        let slices = (total / SLICE_BYTES + 1).min(MAX_SLICES);
+        // A cap that truncates would silently drop the tail of the file — the
+        // exact failure mode this whole method exists to prevent. Widen the
+        // window instead so the last slice always reaches EOF.
+        let width = (total / slices.max(1)).max(SLICE_BYTES);
+
+        if self.store.set_status(item_id, "split").is_err() {
+            return false;
+        }
+        for i in 0..slices {
+            let start = i * width;
+            let end = ((i + 1) * width).min(total);
+            if start >= end {
+                break;
+            }
+            let _ = self.store.create_item(swarm_core::CreateItemInput {
+                peer: "auto-split".into(),
+                title: format!("{}#byte:{}-{}", path, start, end),
+                detail: format!(
+                    "Split from {:?} — analyse ONLY the byte range [{}, {}) of {} ({} KB of {}). \
+                     Read it with a byte-offset window, not a full-file read: the bash tool truncates \
+                     at 16 KB, so `cat` would show you the first 16 KB of the whole file regardless of \
+                     where you are. Original item detail follows.\n\n{}",
+                    item.title,
+                    start,
+                    end,
+                    path,
+                    (end - start) / 1024,
+                    total / 1024,
+                    item.detail
+                ),
+                parent_id: Some(item_id.to_string()),
+                kind: "task".into(),
+                priority: 0,
+            });
+        }
+        self.store.child_count(item_id).unwrap_or(0) > 0
     }
 
     /// Split an item that has failed repeatedly, so its parts can each pass the

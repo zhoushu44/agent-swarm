@@ -1281,6 +1281,29 @@ impl Store {
         .map_err(|e| SwarmError::Store(format!("child count: {}", e)))
     }
 
+    /// The children of an item, oldest first.
+    ///
+    /// Needed by the byte-slicing split, which has to verify that the windows it
+    /// created are contiguous and reach EOF — a split that silently drops the
+    /// tail of a file is worse than no split at all.
+    pub fn children_of(&self, parent_id: &str) -> Result<Vec<Item>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM items WHERE parent_id = ? ORDER BY seq ASC, id ASC",
+                ITEM_COLUMNS
+            ))
+            .map_err(|e| SwarmError::Store(format!("children prepare: {}", e)))?;
+        let rows = stmt
+            .query_map(params![parent_id], scan_item)
+            .map_err(|e| SwarmError::Store(format!("children query: {}", e)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| SwarmError::Store(format!("children row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
     // --------------------------------------------------------------- search
 
     /// Substring search over context text (Go `SearchContext`).

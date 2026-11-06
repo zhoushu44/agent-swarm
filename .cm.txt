@@ -1,0 +1,26 @@
+feat(swarm-rs): 单文件超大自动按字节切片
+
+`split_item` 只认资源轴（一个 item 名下的文件数），而一个文件就是一个资源，
+所以「分析这个 20MB bundle」这类 item 永远拆不开——它只会一次次烧光 lease。
+实测连续 5 次、每次约 800 秒、零进展。
+
+现在单文件 ≥ 512KB 时走新路径 `split_oversized_single_file`：
+按字节切成 `path#byte:START-END` 子项，每片约 160KB，上限 24 片。窗口保证
+连续且覆盖到 EOF——这个方法存在的理由就是「别让 worker 只看到文件的 0.8%」，
+自己把尾巴丢掉就本末倒置。
+
+子项 detail 明确告知：不要整文件读，bash 输出截断在 16KB，要用字节偏移窗口。
+
+配套改 `RESOURCE_RE`：新增 `#byte:\d+-\d+` 分支，且必须排在 `#symbol` 之前。
+Rust 正则是最左优先，`[A-Za-z_][A-Za-z0-9_]*` 会匹配到 `byte` 就停在 `:`，
+于是每个窗口的 artifact_key 都是 `f:bundle.js#byte`，create_item 把它们全折叠成
+一个子项——切片静默失效，且没有任何报错。这个坑是靠 `byte_range_titles_are_distinct_dedup_keys`
+测试抓出来的：断言两个不同窗口的 key 必须不同，第一次跑就红了。
+
+顺带加 `Store::children_of()`：切片后要验证窗口连续且到达 EOF，需要一个能列出
+子项的方法（原来只有 child_count）。
+
+测试 334 全绿，新增 3 个：
+- byte_range_titles_are_distinct_dedup_keys
+- oversized_single_file_splits_into_byte_windows（含连续性 + 覆盖到 EOF 断言）
+- small_single_file_is_left_alone（4KB 不该被切，多一次 claim+merge 更贵）
