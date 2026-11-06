@@ -129,10 +129,17 @@ fn memory_scopes(dir: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Canonicalize when possible: `swarm run .` and `swarm run /abs/path` must
     // hit the same scope, or the same project accumulates two disjoint memories.
+    // `canonicalize` on Windows yields `\\?\E:\path`. Storing that verbatim makes
+    // every scope unreadable and unportable, so strip the verbatim prefix and use
+    // forward slashes: one stable key per directory, comparable across sessions.
     let abs = std::fs::canonicalize(dir)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| dir.to_string());
-    let normalized = abs.replace('\\', "/");
+    let normalized = abs
+        .strip_prefix(r"\\?\")
+        .or_else(|| abs.strip_prefix("//?/"))
+        .unwrap_or(&abs)
+        .replace('\\', "/");
     out.push(format!("project:{normalized}"));
 
     // Windows hands out 8.3 short names (`ADMINI~1`) in `%TEMP%` and in some
@@ -2172,6 +2179,7 @@ fn guard_of(v: &Verdict) -> GuardId {
         _ => GuardId::HardTurns,
     }
 }
+
 
 
 

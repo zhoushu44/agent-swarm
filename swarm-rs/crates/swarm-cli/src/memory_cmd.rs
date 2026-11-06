@@ -229,9 +229,17 @@ fn normalize_scope(scope: &str) -> String {
     let Some(rest) = scope.strip_prefix("project:") else {
         return scope.to_string();
     };
+    // Must match `runner::memory_scopes` byte for byte, including the verbatim
+    // prefix strip: Windows `canonicalize` returns `\\?\E:\path`, and storing that
+    // would create a second, unreadable scope for the same directory.
     let resolved = std::fs::canonicalize(rest)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| rest.to_string());
-    format!("project:{}", resolved.replace('\\', "/"))
+    let cleaned = resolved
+        .strip_prefix(r"\\?\")
+        .or_else(|| resolved.strip_prefix("//?/"))
+        .unwrap_or(&resolved)
+        .replace('\\', "/");
+    format!("project:{cleaned}")
 }
 
