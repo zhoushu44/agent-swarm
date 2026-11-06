@@ -102,10 +102,41 @@ CREATE INDEX IF NOT EXISTS run_log_item_idx ON run_log(item_id);
 CREATE INDEX IF NOT EXISTS run_log_ts_idx ON run_log(ts);
 "#;
 
+/// The cross-run memory store, kept in its own database file.
+///
+/// Deliberately NOT part of `BASE_SCHEMA`: the project `swarm.db` is disposable
+/// per run and must stay compatible with the Go binary, while memory has to
+/// outlive every run and every project. Two lifetimes, two files.
+///
+/// `scope` is free-form so one file can serve several unrelated work streams
+/// without them bleeding into each other:
+///
+///   * `project:<abs path>` — what was learned working in one repo
+///   * `tag:<name>`         — cross-project lessons ("playwright", "1688")
+///   * `global`             — operator preferences, tool quirks
+///
+/// Rows are written once and read many times, so `hits` / `last_hit_at` exist to
+/// let `prune` drop notes nobody ever looked at again.
+pub const MEMORY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS memories (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	scope       TEXT NOT NULL,
+	kind        TEXT NOT NULL DEFAULT 'FACT',
+	text        TEXT NOT NULL,
+	tags        TEXT,
+	source      TEXT NOT NULL DEFAULT '',
+	created_at  INTEGER NOT NULL DEFAULT 0,
+	hits        INTEGER NOT NULL DEFAULT 0,
+	last_hit_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS memories_scope_idx ON memories(scope);
+CREATE INDEX IF NOT EXISTS memories_kind_idx ON memories(kind);
+CREATE INDEX IF NOT EXISTS memories_created_idx ON memories(created_at);
+"#;
+
 /// Additive columns the Go version adds after the base schema.
 ///
-/// Each entry is `(table, column, definition)`. Applied idempotently by
-/// checking `PRAGMA table_info` first, which is more predictable than relying on
+/// Each entry is `(table, column, definition)`. Applied idempotently by checking `PRAGMA table_info` first, which is more predictable than relying on
 /// the driver's duplicate-column error message.
 const ADDITIVE_COLUMNS: &[(&str, &str, &str)] = &[
     ("events", "mark_type", "TEXT"),

@@ -1,0 +1,78 @@
+feat(swarm-rs): 跨 run 记忆 + memory compact 压缩
+
+## 问题
+
+swarm 的 board 是**一次性**的：`.swarm/swarm.db` 跟着任务生灭，里面没有任何东西
+能活到下一次 run。结果是每次开跑都从零认知开始——同一个坑重新踩，同一个工具怪癖
+重新发现，同一条「这个接口是陷阱」写下来又被丢掉。
+
+三轮真实跑（254 / 175 / 72 个 item）里，`FACT` 事件写了上百条，全部随 board
+一起死了。
+
+## 方案：两条独立的生命周期
+
+`swarm.db` 每项目每任务一份、可丢弃；记忆必须跨 run 跨项目存活。两种寿命，
+两个文件。
+
+新增 `swarm-store/src/memory.rs`，落在 `$SWARM_MEMORY` 或 `~/.swarm/memory.db`：
+
+- `scope` 自由字符串，约定三种前缀：
+  - `project:<abs path>` —— 在这个仓库里学到的
+  - `tag:<name>` —— 跨项目的同类经验
+  - `global` —— 本机层面的怪癖
+- 前缀匹配（`scope = ? OR scope LIKE '?/%'`，带 `%`/`_` 转义——Windows 路径里
+  的下划线不能变成通配符）
+- `(scope, text)` 唯一：同一个教训在一个 run 里被反复 POST 不会变成十条
+- `hits` / `last_hit_at`：只有被真正喂给 worker 过的笔记才计数，`prune` 靠它区分
+  「没人再看过」和「这条救了命」
+
+接入点：
+- `Runner::new` 读一次，渲染成块，**跑全程不变**（每 turn 变化会毁掉 KV cache）
+- 块插在 conventions 之后、TOOLS 之前；空则不出现，所以 golden fixture 保持字节一致
+- `persist_memory` 在 report 之后跑一次，只收 `FACT` 和 `FAIL`，且文本 < 40 字符的丢弃
+  （过滤 "w3 online" 这种）；记忆文件坏了不影响 run
+- `--no-memory` 开关：关掉则 run 完全可由仓库复现，无隐藏状态
+
+## memory compact：为什么是命令不是 swarm item
+
+compaction 需要：读一张表、调一次模型、写回。不需要 board、worktree、claim、gate、
+merge。走 swarm 会得到一个「worktree 是用户 home 目录、验收标准是散文好不好读」的
+item —— gate 无法检查。而且它会和并发写 FACT 的 worker 抢同一个记忆文件。
+
+所以是独立的单次 LLM 调用。
+
+## 压缩的安全网
+
+三条硬约束，缺一条都会让这个功能变成数据丢失器：
+
+1. **覆盖校验**：每个输入 id 必须恰好出现一次（在某个 `merged[].ids` 里，或在
+   `drop` 里）。模型忘掉十条就会清空十条，而没人会注意到直到重新踩坑。
+2. **FAIL 不可丢弃**：`FAIL` 是花了一整个 lease 才换来的死路记录，只能合并。
+   这是硬规则不是 prompt 建议。
+3. **拒绝回声**：第一次真实跑，模型把 `#1 [FACT] cmd.exe 里...` 原样复制回来当
+   「合并结果」。多源合并如果逐字包含某个源，就是没干活。
+
+## 模型不稳定，所以有重试
+
+同一个 prompt 两次结果不同：一次正确丢弃进度噪音，下一次把 `[FACT]` 标记复制进
+输出。与其放宽校验器直到它接受烂输出，不如重试三次（校验失败即重试）。
+
+格式噪音（`#3 [FACT] xxx` 的前缀）单独处理：清洗掉而不是拒绝整个 plan——为格式
+问题让整次压缩失败，会让这个命令在模型行为不稳定时完全不可用。
+
+## 验证
+
+真实跑（`deepseek-v4-flash`，5 条 global 笔记）：
+
+```
+compacting 5 note(s)...
+plan: 3 merged note(s) from 5 input(s), 0 dropped, 0 left as-is
+  + [#4,#5,#6] 扫描第 1–3 轮并行进行中：worker w1/w2/w3 各自处理对应分片
+  + [#7] Playwright 在 Windows 上需要 --no-sandbox，否则启动失败
+  + [#1] cmd.exe 里 git commit -m 带空格会截断，需使用单 token 消息
+applied: 3 merged note(s) written, 5 old note(s) removed
+```
+
+测试 25 个套件全绿。新增 15 个：memory 存储 7 个（作用域、前缀匹配、通配符转义、
+去重、搜索、prune），compact 9 个（JSON 解析、代码围栏、覆盖校验、重复 id、FAIL
+不可丢、回声检测、单源直通）。

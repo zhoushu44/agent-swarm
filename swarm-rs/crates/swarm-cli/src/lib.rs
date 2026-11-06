@@ -28,6 +28,7 @@
 pub mod autoscaler;
 pub mod breaker;
 pub mod breaker_report;
+pub mod compact;
 pub mod runner;
 pub mod sysload;
 pub mod worker;
@@ -35,6 +36,7 @@ pub mod worker;
 pub use autoscaler::{Autoscaler, ScaleDecision};
 pub use breaker::{CircuitBreaker, GuardId, Verdict, World};
 pub use breaker_report::BreakerReport;
+pub use compact::{apply_plan, parse_plan, plan_compaction, verify_coverage, CompactPlan};
 pub use breaker::hold_outran_clock;
 pub use runner::{
     baseline_note_for_testing, progress_for_testing, CancellationToken, GateState, Runner,

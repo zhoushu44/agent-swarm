@@ -134,6 +134,14 @@ pub struct Options {
     /// parses a `DoD:` paragraph out of `item.detail` and hands it over here, so
     /// the worker sees what "done" means before it starts instead of guessing.
     pub dod: String,
+    /// Cross-run notes, already rendered as bullet lines (no header).
+    ///
+    /// Empty omits the whole block, which is what keeps the golden fixtures
+    /// byte-identical when memory is disabled. When present it is spliced in
+    /// AFTER the conventions and BEFORE the tools block — it is the same kind of
+    /// thing: standing instructions that outrank improvisation but rank below
+    /// the task itself.
+    pub memory: String,
 }
 
 /// The Definition-of-Done block prefix.
@@ -273,6 +281,30 @@ pub fn build_worker_prompt(o: &Options) -> String {
                 out.push_str(&o.conventions);
                 out.push('\n');
             }
+        }
+    }
+
+    // Cross-run memory sits after the conventions and before the tools block.
+    //
+    // Deliberately conditional: with no notes the prompt is byte-identical to
+    // what the golden fixtures captured, so memory being off cannot change model
+    // behaviour by accident.
+    if !o.memory.trim().is_empty() {
+        const TOOLS_MARKER: &str = "TOOLS:";
+        let block = format!(
+            "CROSS-RUN MEMORY (notes from earlier sessions — treat as strong hints, not gospel;\n\
+             the code in front of you always wins if they disagree):\n{}\n",
+            o.memory.trim_end()
+        );
+        match out.find(TOOLS_MARKER) {
+            Some(i) => {
+                let mut spliced = String::with_capacity(out.len() + block.len());
+                spliced.push_str(&out[..i]);
+                spliced.push_str(&block);
+                spliced.push_str(&out[i..]);
+                out = spliced;
+            }
+            None => out.push_str(&block),
         }
     }
 

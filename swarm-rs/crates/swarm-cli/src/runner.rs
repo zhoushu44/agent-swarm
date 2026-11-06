@@ -13,7 +13,7 @@ use std::time::Duration;
 use swarm_config::RunConfig;
 use swarm_git::Repo;
 use swarm_harness::{AdaptiveGate, AgentLoopConfig};
-use swarm_store::Store;
+use swarm_store::{MemoryStore, Store};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::autoscaler::{Autoscaler, ScaleDecision};
@@ -119,6 +119,100 @@ pub struct GateState {
     pub backoffs: u64,
 }
 
+/// Which memory scopes a run reads.
+///
+/// The project scope is the absolute run directory, so two checkouts of the same
+/// repo at different paths get separate memories — they usually are different
+/// things. `global` is always included: machine-wide quirks (a tool that needs a
+/// flag on Windows, an endpoint that rate-limits) apply everywhere.
+fn memory_scopes(dir: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // Canonicalize when possible: `swarm run .` and `swarm run /abs/path` must
+    // hit the same scope, or the same project accumulates two disjoint memories.
+    let abs = std::fs::canonicalize(dir)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| dir.to_string());
+    let normalized = abs.replace('\\', "/");
+    out.push(format!("project:{normalized}"));
+
+    // Windows hands out 8.3 short names (`ADMINI~1`) in `%TEMP%` and in some
+    // shells, while `canonicalize` always returns the long form. An operator who
+    // types the short path into `swarm memory add` would otherwise write a note
+    // that no run ever reads — the worst failure mode for this feature, because
+    // it looks like it worked.
+    //
+    // Add the short form as an alias scope when it differs, so both spellings
+    // resolve to the same project.
+    if let Ok(short) = short_path(&normalized) {
+        if short != normalized {
+            out.push(format!("project:{short}"));
+        }
+    }
+
+    out.push("global".into());
+    out
+}
+
+/// Best-effort 8.3 short form of an absolute path.
+///
+/// Windows-only and purely additive: any failure (non-Windows, path not on a
+/// device that supports short names, permission denied) just means no alias.
+#[cfg(windows)]
+fn short_path(long: &str) -> Result<String, ()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ffi::OsStr;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(
+            long: *const u16,
+            short: *mut u16,
+            len: u32,
+        ) -> u32;
+    }
+
+    let wide: Vec<u16> = OsStr::new(long)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return Err(());
+    }
+    let s = String::from_utf16_lossy(&buf[..n as usize]);
+    Ok(s.replace('\\', "/"))
+}
+
+#[cfg(not(windows))]
+fn short_path(_long: &str) -> Result<String, ()> {
+    Err(())
+}
+
+/// Render notes as the bullet block the prompt expects.
+///
+/// Capped twice: at most `limit` notes, and each trimmed to ~240 chars. A memory
+/// block that outgrows the task description is a bug — it means stale notes have
+/// accumulated faster than useful ones, and the model spends its attention on
+/// history instead of the work.
+fn render_memory_block(notes: &[swarm_store::Memory]) -> String {
+    const MAX_NOTES: usize = 25;
+    const MAX_CHARS: usize = 240;
+    let mut out = String::new();
+    for m in notes.iter().take(MAX_NOTES) {
+        let mut text = m.text.replace('\n', " ");
+        if text.chars().count() > MAX_CHARS {
+            text = text.chars().take(MAX_CHARS).collect::<String>() + "…";
+        }
+        out.push_str("- [");
+        out.push_str(&m.kind);
+        out.push_str("] ");
+        out.push_str(&text);
+        out.push('\n');
+    }
+    out
+}
+
 /// The swarm runner.
 pub struct Runner {
     cfg: RunConfig,
@@ -150,6 +244,15 @@ pub struct Runner {
     /// Latest observed gate state, for the report and for tests.
     gate_state: Arc<Mutex<GateState>>,
     started_at: std::time::Instant,
+    /// Cross-run memory, or `None` when the operator passed `--no-memory`.
+    ///
+    /// Loaded once at run start and rendered into a prompt block that every
+    /// worker gets on every turn. Not per-worker and not per-item: the whole
+    /// point is that it is shared context nobody has to re-derive.
+    memory: Option<MemoryStore>,
+    /// The rendered block, computed once so the prompt prefix stays stable
+    /// across turns (a prefix that changes per turn costs KV cache every turn).
+    memory_block: String,
 }
 
 impl Runner {
@@ -169,6 +272,41 @@ impl Runner {
         // so a later AIMD back-off still works exactly as before.
         gate.pin_ceiling(cfg.max_workers);
         let gate_state = Arc::new(Mutex::new(GateState::default()));
+
+        // Cross-run memory: load once, render once.
+        //
+        // Scopes are built from the run's own directory so a note learned in one
+        // repo does not leak into another, plus `global` for machine-wide quirks.
+        // `--no-memory` (memory_enabled == false) skips both load and write, which
+        // is what keeps an air-gapped or reproducible run free of hidden state.
+        let (memory, memory_block) = if cfg.memory_enabled {
+            match MemoryStore::open(&cfg.memory_path) {
+                Ok(ms) => {
+                    let scopes = memory_scopes(&dir);
+                    let notes = ms.recall(&scopes, 40).unwrap_or_default();
+                    let block = render_memory_block(&notes);
+                    if !notes.is_empty() {
+                        println!(
+                            "[swarm] memory: {} note(s) from {}",
+                            notes.len(),
+                            ms.path().display()
+                        );
+                        let ids: Vec<i64> = notes.iter().map(|m| m.id).collect();
+                        let _ = ms.note_served(&ids);
+                    }
+                    (Some(ms), block)
+                }
+                Err(e) => {
+                    // Memory is an accelerator, never a prerequisite: a locked or
+                    // corrupt file must not stop a run.
+                    eprintln!("[swarm] memory unavailable ({e}); continuing without it");
+                    (None, String::new())
+                }
+            }
+        } else {
+            (None, String::new())
+        };
+
         Self {
             cfg,
             store,
@@ -183,6 +321,8 @@ impl Runner {
             gate,
             gate_state,
             started_at: std::time::Instant::now(),
+            memory,
+            memory_block,
         }
     }
 
@@ -230,7 +370,65 @@ impl Runner {
         }
 
         self.report(&stop);
+        self.persist_memory(&stop);
         Ok(())
+    }
+
+    /// Write this run's durable lessons back to the shared memory file.
+    ///
+    /// Deliberately conservative — a memory file that fills with noise is worse
+    /// than an empty one, because the next run's prompt gets crowded out by
+    /// things that do not apply. Only two sources qualify:
+    ///
+    ///   * `FAIL` events whose text names a concrete dead end. A bare "failed" is
+    ///     not a lesson; "endpoint returns 500 even with a valid signature" is.
+    ///   * `FACT` events, which workers already reserve for durable knowledge.
+    ///
+    /// Everything else — turn summaries, progress notes, "w10 online" — stays on
+    /// the board where it belongs and dies with the run.
+    ///
+    /// Runs once, after the report, so a crash mid-run loses nothing (the events
+    /// are already durable in `swarm.db` and can be replayed by hand).
+    fn persist_memory(&self, _stop_reason: &str) {
+        let Some(ms) = &self.memory else {
+            return;
+        };
+        let scopes = memory_scopes(&self.repo.dir.to_string_lossy());
+        let Some(project_scope) = scopes.first() else {
+            return;
+        };
+
+        let events = self.store.search_context("", 2000).unwrap_or_default();
+        let mut written = 0usize;
+        for ev in events {
+            let kind = ev.kind.as_str();
+            if kind != "FACT" && kind != "FAIL" {
+                continue;
+            }
+            let text = ev.text.trim();
+            // Too short to carry a lesson: "ok", "done", "w3 online".
+            if text.chars().count() < 40 {
+                continue;
+            }
+            // Filter the chatter that looks like a FAIL but teaches nothing.
+            let lower = text.to_lowercase();
+            if lower.contains("online") || lower.contains("starting analysis") {
+                continue;
+            }
+            let source = format!("run:{}", ev.peer);
+            if ms
+                .remember(project_scope, kind, text, &ev.tags.unwrap_or_default(), &source)
+                .is_ok()
+            {
+                written += 1;
+            }
+        }
+        if written > 0 {
+            println!(
+                "[swarm] memory: wrote {written} note(s) to {}",
+                ms.path().display()
+            );
+        }
     }
 
     /// The world as the breakers currently see it.
@@ -253,6 +451,7 @@ impl Runner {
             stalled_spawns: self.stalled_spawns.clone(),
             gate: self.gate.clone(),
             gate_state: self.gate_state.clone(),
+            memory_block: self.memory_block.clone(),
         };
         handle.observe(&cb, TurnOutcome::default()).await
     }
@@ -478,6 +677,7 @@ impl Runner {
             stalled_spawns: self.stalled_spawns.clone(),
             gate: self.gate.clone(),
             gate_state: self.gate_state.clone(),
+            memory_block: self.memory_block.clone(),
         };
         tokio::spawn(async move {
             let mut cb = CircuitBreaker::new(handle.cfg.clone());
@@ -1133,6 +1333,12 @@ struct WorkerHandle {
     gate: AdaptiveGate,
     /// Shared with the runner so the report can print the gate's state.
     gate_state: Arc<Mutex<GateState>>,
+    /// Pre-rendered cross-run memory block, identical for every worker and turn.
+    ///
+    /// A `String` rather than the `MemoryStore` itself: workers never read the
+    /// file, they just get the rendered notes. That keeps the hot path free of
+    /// lock contention on a shared SQLite handle.
+    memory_block: String,
 }
 
 impl WorkerHandle {
@@ -1278,6 +1484,7 @@ impl WorkerHandle {
                 brief,
                 harness: self.cfg.harness_name.clone(),
                 dod,
+                memory: self.memory_block.clone(),
                 ..Default::default()
             });
 
@@ -1853,6 +2060,7 @@ pub async fn progress_for_testing(dir: &std::path::Path) -> WorkProgress {    le
         stalled_spawns: Arc::new(AtomicUsize::new(0)),
         gate: AdaptiveGate::new(8),
         gate_state: Arc::new(Mutex::new(GateState::default())),
+        memory_block: String::new(),
     };
     handle.progress().await
 }
@@ -1879,6 +2087,7 @@ pub async fn baseline_note_for_testing(
         stalled_spawns: Arc::new(AtomicUsize::new(0)),
         gate: AdaptiveGate::new(8),
         gate_state: Arc::new(Mutex::new(GateState::default())),
+        memory_block: String::new(),
     };
     handle.baseline_note(integration, head_before).await
 }
@@ -1963,6 +2172,7 @@ fn guard_of(v: &Verdict) -> GuardId {
         _ => GuardId::HardTurns,
     }
 }
+
 
 
 

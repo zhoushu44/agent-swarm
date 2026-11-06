@@ -11,8 +11,10 @@
 //!    Rejecting `in_progress` at the door would leave an item stuck forever
 //!    once its lease elapsed (Go claims.go L36-41 explains this at length).
 
+pub mod memory;
 pub mod resources;
 pub mod schema;
 pub mod store;
 
+pub use memory::{Memory, MemoryStore};
 pub use store::Store;

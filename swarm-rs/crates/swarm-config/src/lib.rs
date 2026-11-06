@@ -49,6 +49,15 @@ pub struct RunConfig {
     /// Stop after this long with NO progress; `Duration::ZERO` means
     /// "use the default" (10 minutes).
     pub idle_stop: Duration,
+    /// Load cross-run memory into every worker prompt, and write back what the
+    /// run learned. `--no-memory` clears it.
+    ///
+    /// Off means the run is reproducible from the repo alone: no notes in, no
+    /// notes out. Useful when a stale note would be worse than no note, and for
+    /// benchmarks that must be comparable between runs.
+    pub memory_enabled: bool,
+    /// Where the memory file lives. Empty means `MemoryStore::default_path()`.
+    pub memory_path: String,
 }
 
 impl Default for RunConfig {
@@ -81,6 +90,8 @@ impl Default for RunConfig {
             max_wall_clock: Duration::from_secs(6 * 3600),
             max_item_seconds: 300,
             idle_stop: Duration::from_secs(10 * 60),
+            memory_enabled: true,
+            memory_path: String::new(),
         }
     }
 }
@@ -219,6 +230,8 @@ pub fn parse_run_args(args: &[String]) -> Result<RunArgs, ParseError> {
             "--exit-when-done" => cfg.exit_when_done = true,
             "--no-exit-when-done" => cfg.exit_when_done = false,
             "--no-create" => cfg.no_create = true,
+            "--no-memory" => cfg.memory_enabled = false,
+            "--memory-path" => cfg.memory_path = val!(),
             "--max-wall-clock" => {
                 let raw = val!();
                 // "0" disables the ceiling; otherwise Go duration syntax.

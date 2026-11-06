@@ -10,6 +10,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[path = "memory_cmd.rs"]
+mod memory_cmd;
+
+use memory_cmd::cmd_memory;
 
 use swarm_config::{parse_run_args, ParseError};
 use swarm_git::Repo;
@@ -29,7 +33,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().cloned() else {
         eprintln!("usage: swarm <command> [args]");
-        eprintln!("commands: init, seed, run, board, status, log");
+        eprintln!("commands: init, seed, run, board, status, log, memory");
         return ExitCode::FAILURE;
     };
 
@@ -74,9 +78,16 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "memory" => match cmd_memory(rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("memory: {e}");
+                ExitCode::FAILURE
+            }
+        },
         other => {
             eprintln!("unknown command {other:?}");
-            eprintln!("commands: init, seed, run, board, status, log");
+            eprintln!("commands: init, seed, run, board, status, log, memory");
             ExitCode::FAILURE
         }
     }
@@ -329,3 +340,5 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
     }
     Ok(())
 }
+
+
