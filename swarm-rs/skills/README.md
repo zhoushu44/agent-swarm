@@ -16,7 +16,7 @@ Windows 一键安装全局 skill：
 
 | 名称 | 用途 |
 |---|---|
-| [`swarm`](./swarm/SKILL.md) | 跑 agent-swarm 的 Rust 版（swarm-rs）：发起 run、监控、排障。说一句"用 swarm 做 X"即触发 |
+| [`swarm-rust`](./swarm-rust/SKILL.md) | swarm 并行执行器 + wb 跨会话工作台。跑 swarm run、监控、排障，以及跨会话记任务与经验。说一句"用 swarm 做 X"或"接着上次"即触发 |
 
 ## 为什么 skill 要进仓库
 
@@ -25,3 +25,4 @@ skill 里固化的都是**实测得来的操作知识**——哪条命令能跑�
 换机器或换人就丢了，而它们的保质期比代码更长。
 
 放在仓库里的代价只是一个目录，收益是任何人 `git pull` 后都拿到同一套操作手册。
+

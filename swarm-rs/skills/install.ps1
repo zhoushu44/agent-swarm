@@ -2,7 +2,7 @@
 #
 # 用法：
 #   .\skills\install.ps1              # 安装全部
-#   .\skills\install.ps1 -Name swarm  # 只装一个
+#   .\skills\install.ps1 -Name swarm-rust  # 只装一个
 #   .\skills\install.ps1 -Force       # 覆盖已存在的
 #
 # 安装后重启 Claude Code，说"用 swarm 做 X"即可触发。
@@ -53,3 +53,4 @@ foreach ($t in $targets) {
 
 Write-Host ''
 Write-Host 'Restart Claude Code, then say something like "用 swarm 跑这个任务".'
+

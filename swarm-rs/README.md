@@ -28,7 +28,7 @@ cargo build --workspace --release
 
 ## Skill：说一句"用 swarm"就能跑
 
-[`skills/swarm`](./skills/swarm/SKILL.md) 是给 Claude Code 用的运维 skill，固化了实测得来的操作知识（命令、坑、指标读法）。安装：
+[`skills/swarm-rust`](./skills/swarm-rust/SKILL.md) 是给 Claude Code 用的运维 skill，固化了实测得来的操作知识（命令、坑、指标读法）。安装：
 
 ```powershell
 .\skills\install.ps1        # 装到 ~/.claude/skills/
@@ -184,5 +184,6 @@ cargo run -p xtask            # 列出没有生产调用者的 pub 方法
 仍未做（`docs/SUPER-AGENT-IMPROVEMENT-PLAN.md` §5 明确列为「不照搬」）：Router 分层/联邦、A2A 协议栈、端侧 daemon 零信任、记忆压实 Worker、五档自治旋钮——swarm-rs 是单机单信任域的离线编排器，这些解决的是它现在没有的问题。
 
 完整方案见 [`../docs/RUST-TARGET-ARCHITECTURE.md`](../docs/RUST-TARGET-ARCHITECTURE.md)。
+
 
 

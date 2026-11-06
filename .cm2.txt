@@ -1,0 +1,35 @@
+docs(skills): 同步本机 v4.1.0 skill 到仓库，并统一命名
+
+仓库里随附的 skill 停在旧版（6.6 KB 的 v1 通用手册），与本机实际在用的
+v4.1.0（14.5 KB）差了三轮实战沉淀。这次把本机版本同步过来。
+
+## 内容差异
+
+旧版（6.6 KB，无 version 字段）：
+- 只有 swarm 基础命令与几条通用建议
+
+新版（14.5 KB，v4.1.0）：
+- **wb 跨会话工作台**（前半）—— `wb brief`、task/mem 用法、scope 判据、记忆压缩
+- **swarm 何时不调用** —— 深度推理型任务、海量同类小文件都不适合，附实测数据
+  （72 个分片里 46 个是无关的 Babel helper）
+- **大文件处理四档决策表** —— bash 输出硬截断 16KB，`cat` 一个 2MB 文件只看到 0.8%
+- **八条硬规矩**（原六条）—— 新增「seed detail 别写真实文件路径」（踩过三次）
+  和「`--max-item-seconds` 对 2MB+ 输入不够」
+- **排障表 8 行 → 14 行** —— 新增全是真实定位到的：claim 500（复合主键）、
+  claim 409（资源锁）、跑到 60-70% 停（autoscaler GiveUp 终态）、
+  in_progress 但零 done（worktree 旧基线）
+
+## 命名统一
+
+目录名 `skills/swarm` 与 skill 的 `name: swarm-rust` 不一致，安装后会得到
+`~/.claude/skills/swarm/SKILL.md` 但内部自称 `swarm-rust`。改成目录同名：
+
+- `skills/swarm/` → `skills/swarm-rust/`
+- `install.ps1` 注释里的 `-Name swarm` → `-Name swarm-rust`
+- 两处 README 的链接跟着改
+
+## 为什么 skill 值得进仓库
+
+这些内容全是实测得来的操作知识：哪条命令能跑、哪个坑会浪费一小时、哪个指标
+有误导性。只存在于某个人的 `~/.claude/skills/` 里，换机器就丢了，而它们的保质期
+比代码更长。
