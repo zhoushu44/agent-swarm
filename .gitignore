@@ -10,3 +10,4 @@
 *.out
 .git-commit-msg.txt
 .cm.txt
+.c.txt
